@@ -15,9 +15,15 @@ import (
 	"strconv"
 	"sync"
 	"syscall"
+	"time"
 
+	"github.com/google/gopacket"
+	"github.com/google/gopacket/layers"
 	"golang.org/x/net/ipv4"
 	"golang.org/x/net/ipv6"
+
+	"bringyour.com/connect"
+	"bringyour.com/protocol"
 )
 
 var (
@@ -46,6 +52,9 @@ type StdNetBind struct {
 
 	blackhole4 bool
 	blackhole6 bool
+
+	nat       *connect.LocalUserNat
+	natCancel context.CancelFunc
 }
 
 func NewStdNetBind() Bind {
@@ -195,6 +204,15 @@ again:
 		return nil, 0, syscall.EAFNOSUPPORT
 	}
 
+	cancelCtx, cancel := context.WithCancel(context.Background())
+
+	clientId := "test-client-id"
+	s.nat = connect.NewLocalUserNatWithDefaults(
+		cancelCtx,
+		clientId,
+	)
+	s.natCancel = cancel
+
 	return fns, uint16(port), nil
 }
 
@@ -313,6 +331,11 @@ func (s *StdNetBind) Close() error {
 		s.ipv6 = nil
 		s.ipv6PC = nil
 	}
+	if s.nat != nil {
+		s.natCancel()
+		s.nat = nil
+		s.natCancel = nil
+	}
 	s.blackhole4 = false
 	s.blackhole6 = false
 	s.ipv4TxOffload = false
@@ -410,27 +433,84 @@ retry:
 }
 
 func (s *StdNetBind) send(conn *net.UDPConn, pc batchWriter, msgs []ipv6.Message) error {
-	var (
-		n     int
-		err   error
-		start int
-	)
-	if runtime.GOOS == "linux" || runtime.GOOS == "android" {
-		for {
-			n, err = pc.WriteBatch(msgs[start:], 0)
-			if err != nil || n == len(msgs[start:]) {
-				break
-			}
-			start += n
+	var err error
+
+	for _, packet := range msgs {
+		fmt.Printf("Current packet: %v\n", packet)
+
+		// combine all buffers into a single []byte slice
+		var packetData []byte
+		for _, buffer := range packet.Buffers {
+			packetData = append(packetData, buffer...)
 		}
-	} else {
-		for _, msg := range msgs {
-			_, _, err = conn.WriteMsgUDP(msg.Buffers[0], msg.OOB, msg.Addr.(*net.UDPAddr))
-			if err != nil {
-				break
-			}
+
+		srcIP := net.IP{172, 245, 118, 233}
+		srcPort := layers.UDPPort(33344)
+
+		udpAddr, ok := packet.Addr.(*net.UDPAddr)
+		if !ok {
+			return errors.New("expected *net.UDPAddr")
+		}
+
+		dstIP := udpAddr.IP
+		dstPort := layers.UDPPort(udpAddr.Port)
+
+		ipLayer := &layers.IPv4{
+			SrcIP:    srcIP,
+			DstIP:    dstIP,
+			Version:  4,
+			TTL:      64,
+			Protocol: layers.IPProtocolUDP,
+			// Flags:    layers.IPv4DontFragment,
+		}
+
+		udpLayer := &layers.UDP{
+			SrcPort: srcPort,
+			DstPort: dstPort,
+		}
+		udpLayer.SetNetworkLayerForChecksum(ipLayer)
+
+		// serialize the layers and append the WireGuard packet as payload
+		buffer := gopacket.NewSerializeBuffer()
+		options := gopacket.SerializeOptions{
+			FixLengths:       true, // automatically calculate lengths
+			ComputeChecksums: true, // automatically compute checksums
+		}
+		err := gopacket.SerializeLayers(buffer, options,
+			ipLayer,
+			udpLayer,
+			gopacket.Payload(packetData),
+		)
+		if err != nil {
+			return errors.New("failed to serialize packet")
+		}
+
+		finalPacket := buffer.Bytes()
+		fmt.Printf("Final packet: %x\n", finalPacket)
+
+		ok = s.nat.SendPacket(connect.Path{}, protocol.ProvideMode_Network, finalPacket, 1*time.Second)
+		if !ok {
+			return errors.New("failed to send packet")
+		} else {
+			fmt.Println("send packet")
 		}
 	}
+	// if runtime.GOOS == "linux" || runtime.GOOS == "android" {
+	// 	for {
+	// 		n, err = pc.WriteBatch(msgs[start:], 0)
+	// 		if err != nil || n == len(msgs[start:]) {
+	// 			break
+	// 		}
+	// 		start += n
+	// 	}
+	// } else {
+	// for _, msg := range msgs {
+	// 	_, _, err = conn.WriteMsgUDP(msg.Buffers[0], msg.OOB, msg.Addr.(*net.UDPAddr))
+	// 	if err != nil {
+	// 		break
+	// 	}
+	// }
+	// }
 	return err
 }
 
