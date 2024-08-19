@@ -9,23 +9,39 @@ package tun
  */
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"sync"
 	"syscall"
 	"time"
 	"unsafe"
 
+	"github.com/google/gopacket"
+	"github.com/google/gopacket/layers"
 	"golang.org/x/sys/unix"
 	"golang.zx2c4.com/wireguard/conn"
 	"golang.zx2c4.com/wireguard/rwcancel"
+
+	"bringyour.com/connect"
+	"bringyour.com/protocol"
 )
 
 const (
 	cloneDevicePath = "/dev/net/tun"
 	ifReqSize       = unix.IFNAMSIZ + 64
 )
+
+type NATKey struct {
+	IP   string
+	Port int // Use int to accommodate both TCP and UDP ports
+}
+
+type NATValue struct {
+	IP net.IP
+}
 
 type NativeTun struct {
 	tunFile                 *os.File
@@ -37,8 +53,6 @@ type NativeTun struct {
 	hackListenerClosed      sync.Mutex
 	statusListenersShutdown chan struct{}
 	batchSize               int
-	vnetHdr                 bool
-	udpGSO                  bool
 
 	closeOnce sync.Once
 
@@ -46,13 +60,16 @@ type NativeTun struct {
 	nameCache string    // name of interface
 	nameErr   error
 
-	readOpMu sync.Mutex                    // readOpMu guards readBuff
-	readBuff [virtioNetHdrLen + 65535]byte // if vnetHdr every read() is prefixed by virtioNetHdr
+	writeOpMu sync.Mutex // writeOpMu guards toWrite
+	toWrite   []int
 
-	writeOpMu   sync.Mutex // writeOpMu guards toWrite, tcpGROTable
-	toWrite     []int
-	tcpGROTable *tcpGROTable
-	udpGROTable *udpGROTable
+	natTableMu sync.Mutex
+	natTable   map[NATKey]NATValue
+
+	nat       *connect.LocalUserNat
+	natCancel context.CancelFunc
+
+	rcvChan chan []byte
 }
 
 func (tun *NativeTun) File() *os.File {
@@ -335,8 +352,6 @@ func (tun *NativeTun) nameSlow() (string, error) {
 func (tun *NativeTun) Write(bufs [][]byte, offset int) (int, error) {
 	tun.writeOpMu.Lock()
 	defer func() {
-		tun.tcpGROTable.reset()
-		tun.udpGROTable.reset()
 		tun.writeOpMu.Unlock()
 	}()
 	var (
@@ -344,134 +359,105 @@ func (tun *NativeTun) Write(bufs [][]byte, offset int) (int, error) {
 		total int
 	)
 	tun.toWrite = tun.toWrite[:0]
-	if tun.vnetHdr {
-		err := handleGRO(bufs, offset, tun.tcpGROTable, tun.udpGROTable, tun.udpGSO, &tun.toWrite)
-		if err != nil {
-			return 0, err
-		}
-		offset -= virtioNetHdrLen
-	} else {
-		for i := range bufs {
-			tun.toWrite = append(tun.toWrite, i)
-		}
+	for i := range bufs {
+		tun.toWrite = append(tun.toWrite, i)
 	}
 	for _, bufsI := range tun.toWrite {
-		n, err := tun.tunFile.Write(bufs[bufsI][offset:])
-		if errors.Is(err, syscall.EBADFD) {
-			return total, os.ErrClosed
-		}
-		if err != nil {
-			errs = errors.Join(errs, err)
+		packetData := bufs[bufsI][offset:]
+		// fmt.Printf("ogPkt: %+x\n", packetData)
+
+		// Create a packet from the raw data
+		packet := gopacket.NewPacket(packetData, layers.LayerTypeIPv4, gopacket.Default)
+
+		// Parse the IPv4 layer
+		if ipv4Layer := packet.Layer(layers.LayerTypeIPv4); ipv4Layer != nil {
+			ipv4 := ipv4Layer.(*layers.IPv4)
+
+			natValue := NATValue{IP: ipv4.SrcIP}
+			natKey := NATKey{}
+
+			// Get the original TCP/UDP/ICMP layer if any
+			transportLayer := packet.TransportLayer()
+			if transportLayer == nil {
+				errs = errors.Join(errs, fmt.Errorf("(write) no transport layer found in packet: %+x", packetData))
+				continue
+			}
+
+			// Print the original packet's source and TTL
+			// fmt.Printf("Original srcIp: %s and ttl: %d \n", ipv4.SrcIP, ipv4.TTL)
+
+			// Modify the source IP and reduce TTL
+			ipv4.SrcIP = net.IPv4(172, 245, 118, 233)
+			ipv4.TTL -= 1
+
+			natKey.IP = ipv4.SrcIP.String()
+
+			// Set the network layer for the transport layer's checksum computation
+			switch t := transportLayer.(type) {
+			case *layers.TCP:
+				t.SetNetworkLayerForChecksum(ipv4)
+				natKey.Port = int(t.SrcPort)
+			case *layers.UDP:
+				t.SetNetworkLayerForChecksum(ipv4)
+				natKey.Port = int(t.SrcPort)
+			default:
+				fmt.Printf("Unsupported transport layer type: %T", t)
+				errs = errors.Join(errs, fmt.Errorf("unsupported transport layer type: %T", t))
+				continue
+			}
+
+			// Serialize the modified packet
+			buffer := gopacket.NewSerializeBuffer()
+			options := gopacket.SerializeOptions{FixLengths: true, ComputeChecksums: true}
+			err := gopacket.SerializeLayers(buffer, options, ipv4, transportLayer.(gopacket.SerializableLayer), gopacket.Payload(transportLayer.LayerPayload()))
+			if err != nil {
+				errs = errors.Join(errs, fmt.Errorf("failed to serialize IPv4 packet: %w", err))
+				continue
+			}
+
+			// Get the modified packet bytes
+			modifiedPacket := buffer.Bytes()
+			// fmt.Printf("write Modified Packet: %+x\n", modifiedPacket)
+
+			// send the packet using custom SendPacket function
+			ok := tun.nat.SendPacket(connect.Path{}, protocol.ProvideMode_Network, modifiedPacket, 1*time.Second)
+			if !ok {
+				errs = errors.Join(errs, errors.New("failed to send packet"))
+			} else {
+				// fmt.Println("sent packet")
+				total += len(modifiedPacket)
+
+				// add nat entry
+				tun.natTableMu.Lock()
+				tun.natTable[natKey] = natValue
+				tun.natTableMu.Unlock()
+
+				// fmt.Printf("NAT Entry: IP: %s, Port: %d -> IP: %s\n", natKey.IP, natKey.Port, natValue.IP.String())
+			}
 		} else {
-			total += n
+			fmt.Println("Failed to parse IPv4 layer from the packet")
 		}
 	}
 	return total, errs
 }
 
-// handleVirtioRead splits in into bufs, leaving offset bytes at the front of
-// each buffer. It mutates sizes to reflect the size of each element of bufs,
-// and returns the number of packets read.
-func handleVirtioRead(in []byte, bufs [][]byte, sizes []int, offset int) (int, error) {
-	var hdr virtioNetHdr
-	err := hdr.decode(in)
-	if err != nil {
-		return 0, err
-	}
-	in = in[virtioNetHdrLen:]
-	if hdr.gsoType == unix.VIRTIO_NET_HDR_GSO_NONE {
-		if hdr.flags&unix.VIRTIO_NET_HDR_F_NEEDS_CSUM != 0 {
-			// This means CHECKSUM_PARTIAL in skb context. We are responsible
-			// for computing the checksum starting at hdr.csumStart and placing
-			// at hdr.csumOffset.
-			err = gsoNoneChecksum(in, hdr.csumStart, hdr.csumOffset)
-			if err != nil {
-				return 0, err
-			}
-		}
-		if len(in) > len(bufs[0][offset:]) {
-			return 0, fmt.Errorf("read len %d overflows bufs element len %d", len(in), len(bufs[0][offset:]))
-		}
-		n := copy(bufs[0][offset:], in)
-		sizes[0] = n
-		return 1, nil
-	}
-	if hdr.gsoType != unix.VIRTIO_NET_HDR_GSO_TCPV4 && hdr.gsoType != unix.VIRTIO_NET_HDR_GSO_TCPV6 && hdr.gsoType != unix.VIRTIO_NET_HDR_GSO_UDP_L4 {
-		return 0, fmt.Errorf("unsupported virtio GSO type: %d", hdr.gsoType)
-	}
-
-	ipVersion := in[0] >> 4
-	switch ipVersion {
-	case 4:
-		if hdr.gsoType != unix.VIRTIO_NET_HDR_GSO_TCPV4 && hdr.gsoType != unix.VIRTIO_NET_HDR_GSO_UDP_L4 {
-			return 0, fmt.Errorf("ip header version: %d, GSO type: %d", ipVersion, hdr.gsoType)
-		}
-	case 6:
-		if hdr.gsoType != unix.VIRTIO_NET_HDR_GSO_TCPV6 && hdr.gsoType != unix.VIRTIO_NET_HDR_GSO_UDP_L4 {
-			return 0, fmt.Errorf("ip header version: %d, GSO type: %d", ipVersion, hdr.gsoType)
-		}
-	default:
-		return 0, fmt.Errorf("invalid ip header version: %d", ipVersion)
-	}
-
-	// Don't trust hdr.hdrLen from the kernel as it can be equal to the length
-	// of the entire first packet when the kernel is handling it as part of a
-	// FORWARD path. Instead, parse the transport header length and add it onto
-	// csumStart, which is synonymous for IP header length.
-	if hdr.gsoType == unix.VIRTIO_NET_HDR_GSO_UDP_L4 {
-		hdr.hdrLen = hdr.csumStart + 8
-	} else {
-		if len(in) <= int(hdr.csumStart+12) {
-			return 0, errors.New("packet is too short")
-		}
-
-		tcpHLen := uint16(in[hdr.csumStart+12] >> 4 * 4)
-		if tcpHLen < 20 || tcpHLen > 60 {
-			// A TCP header must be between 20 and 60 bytes in length.
-			return 0, fmt.Errorf("tcp header len is invalid: %d", tcpHLen)
-		}
-		hdr.hdrLen = hdr.csumStart + tcpHLen
-	}
-
-	if len(in) < int(hdr.hdrLen) {
-		return 0, fmt.Errorf("length of packet (%d) < virtioNetHdr.hdrLen (%d)", len(in), hdr.hdrLen)
-	}
-
-	if hdr.hdrLen < hdr.csumStart {
-		return 0, fmt.Errorf("virtioNetHdr.hdrLen (%d) < virtioNetHdr.csumStart (%d)", hdr.hdrLen, hdr.csumStart)
-	}
-	cSumAt := int(hdr.csumStart + hdr.csumOffset)
-	if cSumAt+1 >= len(in) {
-		return 0, fmt.Errorf("end of checksum offset (%d) exceeds packet length (%d)", cSumAt+1, len(in))
-	}
-
-	return gsoSplit(in, hdr, bufs, sizes, offset, ipVersion == 6)
-}
-
 func (tun *NativeTun) Read(bufs [][]byte, sizes []int, offset int) (int, error) {
-	tun.readOpMu.Lock()
-	defer tun.readOpMu.Unlock()
 	select {
 	case err := <-tun.errors:
 		return 0, err
-	default:
+
+	case packetData := <-tun.rcvChan:
 		readInto := bufs[0][offset:]
-		if tun.vnetHdr {
-			readInto = tun.readBuff[:]
+		n := copy(readInto, packetData) // Copy packet data into the buffer
+
+		// Ensure we don't read more data than the buffer can hold
+		if n > len(readInto) {
+			return 0, fmt.Errorf("packet too large for buffer")
 		}
-		n, err := tun.tunFile.Read(readInto)
-		if errors.Is(err, syscall.EBADFD) {
-			err = os.ErrClosed
-		}
-		if err != nil {
-			return 0, err
-		}
-		if tun.vnetHdr {
-			return handleVirtioRead(readInto[:n], bufs, sizes, offset)
-		} else {
-			sizes[0] = n
-			return 1, nil
-		}
+
+		// fmt.Printf("readTunPkt: %+x\n", packetData[:n])
+		sizes[0] = n
+		return 1, nil
 	}
 }
 
@@ -492,6 +478,11 @@ func (tun *NativeTun) Close() error {
 		}
 		err2 = tun.tunFile.Close()
 	})
+	if tun.nat != nil {
+		tun.natCancel()
+		tun.nat = nil
+		tun.natCancel = nil
+	}
 	if err1 != nil {
 		return err1
 	}
@@ -501,12 +492,6 @@ func (tun *NativeTun) Close() error {
 func (tun *NativeTun) BatchSize() int {
 	return tun.batchSize
 }
-
-const (
-	// TODO: support TSO with ECN bits
-	tunTCPOffloads = unix.TUN_F_CSUM | unix.TUN_F_TSO4 | unix.TUN_F_TSO6
-	tunUDPOffloads = unix.TUN_F_USO4 | unix.TUN_F_USO6
-)
 
 func (tun *NativeTun) initFromFlags(name string) error {
 	sc, err := tun.tunFile.SyscallConn()
@@ -525,22 +510,8 @@ func (tun *NativeTun) initFromFlags(name string) error {
 		if err != nil {
 			return
 		}
-		got := ifr.Uint16()
-		if got&unix.IFF_VNET_HDR != 0 {
-			// tunTCPOffloads were added in Linux v2.6. We require their support
-			// if IFF_VNET_HDR is set.
-			err = unix.IoctlSetInt(int(fd), unix.TUNSETOFFLOAD, tunTCPOffloads)
-			if err != nil {
-				return
-			}
-			tun.vnetHdr = true
-			tun.batchSize = conn.IdealBatchSize
-			// tunUDPOffloads were added in Linux v6.2. We do not return an
-			// error if they are unsupported at runtime.
-			tun.udpGSO = unix.IoctlSetInt(int(fd), unix.TUNSETOFFLOAD, tunTCPOffloads|tunUDPOffloads) == nil
-		} else {
-			tun.batchSize = 1
-		}
+		tun.batchSize = 1
+		// }
 	}); e != nil {
 		return e
 	}
@@ -561,9 +532,8 @@ func CreateTUN(name string, mtu int) (Device, error) {
 	if err != nil {
 		return nil, err
 	}
-	// IFF_VNET_HDR enables the "tun status hack" via routineHackListener()
 	// where a null write will return EINVAL indicating the TUN is up.
-	ifr.SetUint16(unix.IFF_TUN | unix.IFF_NO_PI | unix.IFF_VNET_HDR)
+	ifr.SetUint16(unix.IFF_TUN | unix.IFF_NO_PI) // | unix.IFF_VNET_HDR)
 	err = unix.IoctlIfreq(nfd, unix.TUNSETIFF, ifr)
 	if err != nil {
 		return nil, err
@@ -588,8 +558,6 @@ func CreateTUNFromFile(file *os.File, mtu int) (Device, error) {
 		events:                  make(chan Event, 5),
 		errors:                  make(chan error, 5),
 		statusListenersShutdown: make(chan struct{}),
-		tcpGROTable:             newTCPGROTable(),
-		udpGROTable:             newUDPGROTable(),
 		toWrite:                 make([]int, 0, conn.IdealBatchSize),
 	}
 
@@ -629,7 +597,94 @@ func CreateTUNFromFile(file *os.File, mtu int) (Device, error) {
 		return nil, err
 	}
 
+	// Create NAT table
+	tun.natTable = make(map[NATKey]NATValue)
+	tun.rcvChan = make(chan []byte)
+
+	cancelCtx, cancel := context.WithCancel(context.Background())
+	clientId := "test-client-id"
+	tun.nat = connect.NewLocalUserNatWithDefaults(
+		cancelCtx,
+		clientId,
+	)
+	removeCallback := tun.nat.AddReceivePacketCallback(tun.rcvTest)
+	tun.natCancel = func() {
+		removeCallback()
+		cancel()
+	}
+
 	return tun, nil
+}
+
+func (tun *NativeTun) rcvTest(source connect.Path, ipProtocol connect.IpProtocol, packet []byte) {
+	// fmt.Printf("rcvPkt: %+x\n", packet)
+
+	pkt := gopacket.NewPacket(packet, layers.LayerTypeIPv4, gopacket.Default)
+
+	// Parse the IPv4 layer
+	if ipv4Layer := pkt.Layer(layers.LayerTypeIPv4); ipv4Layer != nil {
+		ipv4 := ipv4Layer.(*layers.IPv4)
+
+		// Get the original TCP/UDP layer if any
+		transportLayer := pkt.TransportLayer()
+		if transportLayer == nil {
+			fmt.Printf("No transport layer found in packet: %+x", packet)
+			return
+		}
+
+		// Set the network layer for the transport layer's checksum computation
+		var dstPort int
+		switch t := transportLayer.(type) {
+		case *layers.TCP:
+			dstPort = int(t.DstPort)
+		case *layers.UDP:
+			dstPort = int(t.DstPort)
+		default:
+			fmt.Printf("unsupported transport layer type: %T", t)
+			return
+		}
+
+		natKey := NATKey{
+			IP:   ipv4.DstIP.String(),
+			Port: dstPort,
+		}
+
+		originalIP, found := tun.natTable[natKey]
+		if !found {
+			fmt.Printf("no NAT entry found for IP: %s, Port: %d\n", ipv4.DstIP, dstPort)
+			return
+		}
+
+		ipv4.DstIP = originalIP.IP
+
+		// Set the network layer for the transport layer's checksum computation
+		switch t := transportLayer.(type) {
+		case *layers.TCP:
+			t.SetNetworkLayerForChecksum(ipv4)
+		case *layers.UDP:
+			t.SetNetworkLayerForChecksum(ipv4)
+		default:
+			fmt.Printf("unsupported transport layer type: %T\n", t)
+			return
+		}
+
+		// Serialize the modified packet
+		buffer := gopacket.NewSerializeBuffer()
+		options := gopacket.SerializeOptions{FixLengths: true, ComputeChecksums: true}
+		err := gopacket.SerializeLayers(buffer, options, ipv4, transportLayer.(gopacket.SerializableLayer), gopacket.Payload(transportLayer.LayerPayload()))
+		if err != nil {
+			fmt.Printf("failed to serialize modified packet: %v\n", err)
+			return
+		}
+
+		// Get the modified packet bytes
+		modifiedPacket := buffer.Bytes()
+		// fmt.Printf("rcv Modified Packet: %+x\n", modifiedPacket)
+
+		tun.rcvChan <- modifiedPacket
+	} else {
+		fmt.Println("Failed to parse IPv4 layer from the packet")
+	}
 }
 
 // CreateUnmonitoredTUNFromFD creates a Device from the provided file
@@ -641,12 +696,10 @@ func CreateUnmonitoredTUNFromFD(fd int) (Device, string, error) {
 	}
 	file := os.NewFile(uintptr(fd), "/dev/tun")
 	tun := &NativeTun{
-		tunFile:     file,
-		events:      make(chan Event, 5),
-		errors:      make(chan error, 5),
-		tcpGROTable: newTCPGROTable(),
-		udpGROTable: newUDPGROTable(),
-		toWrite:     make([]int, 0, conn.IdealBatchSize),
+		tunFile: file,
+		events:  make(chan Event, 5),
+		errors:  make(chan error, 5),
+		toWrite: make([]int, 0, conn.IdealBatchSize),
 	}
 	name, err := tun.Name()
 	if err != nil {
