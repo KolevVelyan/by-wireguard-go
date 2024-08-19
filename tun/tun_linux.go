@@ -36,7 +36,7 @@ const (
 
 type NATKey struct {
 	IP   string
-	Port int // Use int to accommodate both TCP and UDP ports
+	Port int
 }
 
 type NATValue struct {
@@ -351,9 +351,7 @@ func (tun *NativeTun) nameSlow() (string, error) {
 
 func (tun *NativeTun) Write(bufs [][]byte, offset int) (int, error) {
 	tun.writeOpMu.Lock()
-	defer func() {
-		tun.writeOpMu.Unlock()
-	}()
+	defer tun.writeOpMu.Unlock()
 	var (
 		errs  error
 		total int
@@ -363,36 +361,27 @@ func (tun *NativeTun) Write(bufs [][]byte, offset int) (int, error) {
 		tun.toWrite = append(tun.toWrite, i)
 	}
 	for _, bufsI := range tun.toWrite {
-		packetData := bufs[bufsI][offset:]
-		// fmt.Printf("ogPkt: %+x\n", packetData)
-
-		// Create a packet from the raw data
+		packetData := bufs[bufsI][offset:] // TODO: might need to keep offset in beginning?
 		packet := gopacket.NewPacket(packetData, layers.LayerTypeIPv4, gopacket.Default)
 
-		// Parse the IPv4 layer
+		// parse the IPv4 layer
 		if ipv4Layer := packet.Layer(layers.LayerTypeIPv4); ipv4Layer != nil {
-			ipv4 := ipv4Layer.(*layers.IPv4)
-
-			natValue := NATValue{IP: ipv4.SrcIP}
-			natKey := NATKey{}
-
-			// Get the original TCP/UDP/ICMP layer if any
 			transportLayer := packet.TransportLayer()
 			if transportLayer == nil {
-				errs = errors.Join(errs, fmt.Errorf("(write) no transport layer found in packet: %+x", packetData))
+				errs = errors.Join(errs, fmt.Errorf("no transport layer found in packet: %+x", packetData))
 				continue
 			}
 
-			// Print the original packet's source and TTL
-			// fmt.Printf("Original srcIp: %s and ttl: %d \n", ipv4.SrcIP, ipv4.TTL)
+			ipv4 := ipv4Layer.(*layers.IPv4)
+			localSrcIP := NATValue{IP: ipv4.SrcIP} // get pre NAT IP
 
-			// Modify the source IP and reduce TTL
 			ipv4.SrcIP = net.IPv4(172, 245, 118, 233)
 			ipv4.TTL -= 1
 
+			natKey := NATKey{}
 			natKey.IP = ipv4.SrcIP.String()
 
-			// Set the network layer for the transport layer's checksum computation
+			// set network layer for transport layer's checksum and get port for NAT
 			switch t := transportLayer.(type) {
 			case *layers.TCP:
 				t.SetNetworkLayerForChecksum(ipv4)
@@ -401,12 +390,10 @@ func (tun *NativeTun) Write(bufs [][]byte, offset int) (int, error) {
 				t.SetNetworkLayerForChecksum(ipv4)
 				natKey.Port = int(t.SrcPort)
 			default:
-				fmt.Printf("Unsupported transport layer type: %T", t)
 				errs = errors.Join(errs, fmt.Errorf("unsupported transport layer type: %T", t))
 				continue
 			}
 
-			// Serialize the modified packet
 			buffer := gopacket.NewSerializeBuffer()
 			options := gopacket.SerializeOptions{FixLengths: true, ComputeChecksums: true}
 			err := gopacket.SerializeLayers(buffer, options, ipv4, transportLayer.(gopacket.SerializableLayer), gopacket.Payload(transportLayer.LayerPayload()))
@@ -415,27 +402,20 @@ func (tun *NativeTun) Write(bufs [][]byte, offset int) (int, error) {
 				continue
 			}
 
-			// Get the modified packet bytes
 			modifiedPacket := buffer.Bytes()
-			// fmt.Printf("write Modified Packet: %+x\n", modifiedPacket)
-
-			// send the packet using custom SendPacket function
 			ok := tun.nat.SendPacket(connect.Path{}, protocol.ProvideMode_Network, modifiedPacket, 1*time.Second)
 			if !ok {
 				errs = errors.Join(errs, errors.New("failed to send packet"))
 			} else {
-				// fmt.Println("sent packet")
-				total += len(modifiedPacket)
+				total += 1
 
 				// add nat entry
 				tun.natTableMu.Lock()
-				tun.natTable[natKey] = natValue
+				tun.natTable[natKey] = localSrcIP
 				tun.natTableMu.Unlock()
-
-				// fmt.Printf("NAT Entry: IP: %s, Port: %d -> IP: %s\n", natKey.IP, natKey.Port, natValue.IP.String())
 			}
 		} else {
-			fmt.Println("Failed to parse IPv4 layer from the packet")
+			errs = errors.Join(errs, fmt.Errorf("failed to parse packet"))
 		}
 	}
 	return total, errs
@@ -445,17 +425,14 @@ func (tun *NativeTun) Read(bufs [][]byte, sizes []int, offset int) (int, error) 
 	select {
 	case err := <-tun.errors:
 		return 0, err
-
 	case packetData := <-tun.rcvChan:
 		readInto := bufs[0][offset:]
-		n := copy(readInto, packetData) // Copy packet data into the buffer
+		n := copy(readInto, packetData) // copy packet data into the buffer
 
-		// Ensure we don't read more data than the buffer can hold
 		if n > len(readInto) {
 			return 0, fmt.Errorf("packet too large for buffer")
 		}
 
-		// fmt.Printf("readTunPkt: %+x\n", packetData[:n])
 		sizes[0] = n
 		return 1, nil
 	}
@@ -607,7 +584,7 @@ func CreateTUNFromFile(file *os.File, mtu int) (Device, error) {
 		cancelCtx,
 		clientId,
 	)
-	removeCallback := tun.nat.AddReceivePacketCallback(tun.rcvTest)
+	removeCallback := tun.nat.AddReceivePacketCallback(tun.natReceive)
 	tun.natCancel = func() {
 		removeCallback()
 		cancel()
@@ -616,23 +593,18 @@ func CreateTUNFromFile(file *os.File, mtu int) (Device, error) {
 	return tun, nil
 }
 
-func (tun *NativeTun) rcvTest(source connect.Path, ipProtocol connect.IpProtocol, packet []byte) {
-	// fmt.Printf("rcvPkt: %+x\n", packet)
-
+func (tun *NativeTun) natReceive(source connect.Path, ipProtocol connect.IpProtocol, packet []byte) {
 	pkt := gopacket.NewPacket(packet, layers.LayerTypeIPv4, gopacket.Default)
 
-	// Parse the IPv4 layer
 	if ipv4Layer := pkt.Layer(layers.LayerTypeIPv4); ipv4Layer != nil {
-		ipv4 := ipv4Layer.(*layers.IPv4)
-
-		// Get the original TCP/UDP layer if any
 		transportLayer := pkt.TransportLayer()
 		if transportLayer == nil {
 			fmt.Printf("No transport layer found in packet: %+x", packet)
 			return
 		}
 
-		// Set the network layer for the transport layer's checksum computation
+		ipv4 := ipv4Layer.(*layers.IPv4)
+
 		var dstPort int
 		switch t := transportLayer.(type) {
 		case *layers.TCP:
@@ -649,15 +621,14 @@ func (tun *NativeTun) rcvTest(source connect.Path, ipProtocol connect.IpProtocol
 			Port: dstPort,
 		}
 
-		originalIP, found := tun.natTable[natKey]
+		localDstIP, found := tun.natTable[natKey]
 		if !found {
-			fmt.Printf("no NAT entry found for IP: %s, Port: %d\n", ipv4.DstIP, dstPort)
+			fmt.Printf("no NAT entry found for %s:%d\n", ipv4.DstIP, dstPort)
 			return
 		}
+		ipv4.DstIP = localDstIP.IP
 
-		ipv4.DstIP = originalIP.IP
-
-		// Set the network layer for the transport layer's checksum computation
+		// set network layer for transport layer's checksum computation
 		switch t := transportLayer.(type) {
 		case *layers.TCP:
 			t.SetNetworkLayerForChecksum(ipv4)
@@ -668,7 +639,6 @@ func (tun *NativeTun) rcvTest(source connect.Path, ipProtocol connect.IpProtocol
 			return
 		}
 
-		// Serialize the modified packet
 		buffer := gopacket.NewSerializeBuffer()
 		options := gopacket.SerializeOptions{FixLengths: true, ComputeChecksums: true}
 		err := gopacket.SerializeLayers(buffer, options, ipv4, transportLayer.(gopacket.SerializableLayer), gopacket.Payload(transportLayer.LayerPayload()))
@@ -677,10 +647,7 @@ func (tun *NativeTun) rcvTest(source connect.Path, ipProtocol connect.IpProtocol
 			return
 		}
 
-		// Get the modified packet bytes
 		modifiedPacket := buffer.Bytes()
-		// fmt.Printf("rcv Modified Packet: %+x\n", modifiedPacket)
-
 		tun.rcvChan <- modifiedPacket
 	} else {
 		fmt.Println("Failed to parse IPv4 layer from the packet")
