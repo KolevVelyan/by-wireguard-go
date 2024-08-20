@@ -107,16 +107,12 @@ func CreateNetTUN(localAddresses, dnsServers []netip.Addr, mtu int) (tun.Device,
 	return dev, (*Net)(dev), nil
 }
 
-func (tun *netTun) Name() (string, error) {
-	return "go", nil
-}
-
-func (tun *netTun) File() *os.File {
-	return nil
-}
-
 func (tun *netTun) Events() <-chan tun.Event {
 	return tun.events
+}
+
+func (tun *netTun) AddEvent(event tun.Event) {
+	tun.events <- event
 }
 
 func (tun *netTun) Read(buf [][]byte, sizes []int, offset int) (int, error) {
@@ -181,8 +177,8 @@ func (tun *netTun) Close() error {
 	return nil
 }
 
-func (tun *netTun) MTU() (int, error) {
-	return tun.mtu, nil
+func (tun *netTun) MTU() int {
+	return tun.mtu
 }
 
 func (tun *netTun) BatchSize() int {

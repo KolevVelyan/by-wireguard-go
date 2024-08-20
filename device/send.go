@@ -18,7 +18,6 @@ import (
 	"golang.org/x/net/ipv4"
 	"golang.org/x/net/ipv6"
 	"golang.zx2c4.com/wireguard/conn"
-	"golang.zx2c4.com/wireguard/tun"
 )
 
 /* Outbound flow
@@ -302,13 +301,6 @@ func (device *Device) RoutineReadFromTUN() {
 		}
 
 		if readErr != nil {
-			if errors.Is(readErr, tun.ErrTooManySegments) {
-				// TODO: record stat for this
-				// This will happen if MSS is surprisingly small (< 576)
-				// coincident with reasonably high throughput.
-				device.log.Verbosef("Dropped some packets from multi-segment read: %v", readErr)
-				continue
-			}
 			if !device.isClosed() {
 				if !errors.Is(readErr, os.ErrClosed) {
 					device.log.Errorf("Failed to read packet from TUN device: %v", readErr)

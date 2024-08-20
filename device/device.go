@@ -288,9 +288,9 @@ func NewDevice(tunDevice tun.Device, bind conn.Bind, logger *Logger) *Device {
 	device.log = logger
 	device.net.bind = bind
 	device.tun.device = tunDevice
-	mtu, err := device.tun.device.MTU()
-	if err != nil {
-		device.log.Errorf("Trouble determining MTU, assuming default: %v", err)
+	mtu := device.tun.device.MTU()
+	if mtu < 0 {
+		device.log.Errorf("Negative MTU %d, assuming default %d", mtu, DefaultMTU)
 		mtu = DefaultMTU
 	}
 	device.tun.mtu.Store(int32(mtu))
