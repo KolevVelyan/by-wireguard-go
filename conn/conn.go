@@ -28,9 +28,6 @@ const (
 type ReceiveFunc func(packets [][]byte, sizes []int, eps []Endpoint) (n int, err error)
 
 // A Bind listens on a port for both IPv6 and IPv4 UDP traffic.
-//
-// A Bind interface may also be a PeekLookAtSocketFd or BindSocketToInterface,
-// depending on the platform-specific implementation.
 type Bind interface {
 	// Open puts the Bind into a listening state on a given port and reports the actual
 	// port that it bound to. Passing zero results in a random selection.

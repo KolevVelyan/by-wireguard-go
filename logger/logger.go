@@ -3,7 +3,7 @@
  * Copyright (C) 2017-2023 WireGuard LLC. All Rights Reserved.
  */
 
-package device
+package logger
 
 import (
 	"log"

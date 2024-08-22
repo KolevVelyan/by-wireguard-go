@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"golang.zx2c4.com/wireguard/conn"
+	"golang.zx2c4.com/wireguard/logger"
 	"golang.zx2c4.com/wireguard/ratelimiter"
 	"golang.zx2c4.com/wireguard/tun"
 )
@@ -86,7 +87,7 @@ type Device struct {
 
 	ipcMutex sync.RWMutex
 	closed   chan struct{}
-	log      *Logger
+	log      *logger.Logger
 }
 
 // deviceState represents the state of a Device.
@@ -279,7 +280,7 @@ func (device *Device) SetPrivateKey(sk NoisePrivateKey) error {
 	return nil
 }
 
-func NewDevice(tunDevice tun.Device, bind conn.Bind, logger *Logger) *Device {
+func NewDevice(tunDevice tun.Device, bind conn.Bind, logger *logger.Logger) *Device {
 	device := new(Device)
 	device.state.state.Store(uint32(deviceStateDown))
 	device.closed = make(chan struct{})

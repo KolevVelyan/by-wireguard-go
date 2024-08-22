@@ -21,6 +21,7 @@ import (
 
 	"golang.zx2c4.com/wireguard/conn"
 	"golang.zx2c4.com/wireguard/conn/bindtest"
+	"golang.zx2c4.com/wireguard/logger"
 	"golang.zx2c4.com/wireguard/tun"
 	"golang.zx2c4.com/wireguard/tun/tuntest"
 )
@@ -161,11 +162,11 @@ func genTestPair(tb testing.TB, realSocket bool) (pair testPair) {
 		p := &pair[i]
 		p.tun = tuntest.NewChannelTUN()
 		p.ip = netip.AddrFrom4([4]byte{1, 0, 0, byte(i + 1)})
-		level := LogLevelVerbose
+		level := logger.LogLevelVerbose
 		if _, ok := tb.(*testing.B); ok && !testing.Verbose() {
-			level = LogLevelError
+			level = logger.LogLevelError
 		}
-		p.dev = NewDevice(p.tun.TUN(), binds[i], NewLogger(level, fmt.Sprintf("dev%d: ", i)))
+		p.dev = NewDevice(p.tun.TUN(), binds[i], logger.NewLogger(level, fmt.Sprintf("dev%d: ", i)))
 		if err := p.dev.IpcSet(cfg[i]); err != nil {
 			tb.Errorf("failed to configure device %d: %v", i, err)
 			p.dev.Close()

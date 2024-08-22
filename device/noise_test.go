@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"golang.zx2c4.com/wireguard/conn"
+	"golang.zx2c4.com/wireguard/logger"
 	"golang.zx2c4.com/wireguard/tun/tuntest"
 )
 
@@ -38,7 +39,7 @@ func randDevice(t *testing.T) *Device {
 		t.Fatal(err)
 	}
 	tun := tuntest.NewChannelTUN()
-	logger := NewLogger(LogLevelError, "")
+	logger := logger.NewLogger(logger.LogLevelError, "")
 	device := NewDevice(tun.TUN(), conn.NewDefaultBind(), logger)
 	device.SetPrivateKey(sk)
 	return device

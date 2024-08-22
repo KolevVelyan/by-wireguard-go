@@ -9,7 +9,6 @@ import (
 	"bytes"
 	"encoding/base64"
 	"encoding/hex"
-	"fmt"
 	"log"
 	"os"
 	"os/signal"
@@ -17,6 +16,7 @@ import (
 
 	"golang.zx2c4.com/wireguard/conn"
 	"golang.zx2c4.com/wireguard/device"
+	"golang.zx2c4.com/wireguard/logger"
 	"golang.zx2c4.com/wireguard/tun"
 )
 
@@ -43,56 +43,50 @@ func uapiCfgA(cfg ...string) string {
 }
 
 func main() {
-	// get log level (default: info)
-
+	// logger
 	logLevel := func() int {
 		switch os.Getenv("LOG_LEVEL") {
 		case "verbose", "debug":
-			return device.LogLevelVerbose
+			return logger.LogLevelVerbose
 		case "error":
-			return device.LogLevelError
+			return logger.LogLevelError
 		case "silent":
-			return device.LogLevelSilent
+			return logger.LogLevelSilent
 		}
-		return device.LogLevelError
+		return logger.LogLevelError
 	}()
+	logger := logger.NewLogger(logLevel, "")
 
-	logger := device.NewLogger(logLevel, "")
-	logger.Verbosef("Starting wireguard-go version %s", Version)
-
-	utun, err := tun.CreateUserspaceTUN()
+	// tun device
+	utun, err := tun.CreateUserspaceTUN(logger)
 	if err != nil {
 		logger.Errorf("Failed to create TUN device: %v", err)
 		os.Exit(1)
 	}
 
+	// wg device
 	device := device.NewDevice(utun, conn.NewDefaultBind(), logger)
 	logger.Verbosef("Device started")
 
-	// TODO: ipcSet(config of device)
+	// ipcSet
 	inputString1 := "uMQaBFCMKgvMvc9Xvjh1zxVwn9CnXR2/vi+Pl1MaXFw="
 	decodedBytes1, err1 := base64.StdEncoding.DecodeString(inputString1)
 	if err1 != nil {
 		log.Fatal("Error decoding Base64:", err1)
 	}
-	hexString1 := hex.EncodeToString(decodedBytes1)
-
 	inputString2 := "y4bB/atXsi/OfSpE/rs6mA/J2pL+HyQXBj/um6OkNgs="
 	decodedBytes2, err2 := base64.StdEncoding.DecodeString(inputString2)
 	if err2 != nil {
 		log.Fatal("Error decoding Base64:", err2)
 	}
-	hexString2 := hex.EncodeToString(decodedBytes2)
-
 	config := uapiCfgA(
-		"private_key", hexString1,
+		"private_key", hex.EncodeToString(decodedBytes1),
 		"listen_port", "33344",
 		"replace_peers", "true",
-		"public_key", hexString2,
+		"public_key", hex.EncodeToString(decodedBytes2),
 		"replace_allowed_ips", "true",
 		"allowed_ip", "192.168.90.1/32",
 	)
-	fmt.Println(config)
 	err = device.IpcSet(config)
 	if err != nil {
 		logger.Errorf("Failed to Set Config: %v", err)
@@ -100,9 +94,9 @@ func main() {
 		return
 	}
 
-	term := make(chan os.Signal, 1)
+	term := make(chan os.Signal, 1) // channel for termination
 
-	device.AddEvent(tun.EventUp)
+	device.AddEvent(tun.EventUp) // up device
 
 	// wait for program to terminate
 	signal.Notify(term, syscall.SIGTERM)
@@ -115,5 +109,4 @@ func main() {
 
 	// clean up
 	device.Close()
-	logger.Verbosef("Shutting down")
 }
