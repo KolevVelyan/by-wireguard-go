@@ -34,7 +34,7 @@ type NATValue struct {
 	IP net.IP
 }
 
-type NativeTun struct {
+type UserspaceTun struct {
 	closeOnce sync.Once
 	events    chan Event // device related events
 	natRcv    chan []byte
@@ -49,11 +49,40 @@ type NativeTun struct {
 	natCancel context.CancelFunc
 }
 
-func (tun *NativeTun) MTU() int {
+func (tun *UserspaceTun) MTU() int {
 	return 0
 }
 
-func (tun *NativeTun) Write(bufs [][]byte, offset int) (int, error) {
+func (tun *UserspaceTun) Events() <-chan Event {
+	return tun.events
+}
+
+func (tun *UserspaceTun) AddEvent(event Event) {
+	tun.events <- event
+}
+
+func (tun *UserspaceTun) BatchSize() int {
+	return 1
+}
+
+func (tun *UserspaceTun) Close() error {
+	tun.closeOnce.Do(func() {
+		if tun.events != nil {
+			close(tun.events)
+		}
+		if tun.natRcv != nil {
+			close(tun.natRcv)
+		}
+	})
+	if tun.nat != nil {
+		tun.natCancel()
+		tun.nat = nil
+		tun.natCancel = nil
+	}
+	return nil
+}
+
+func (tun *UserspaceTun) Write(bufs [][]byte, offset int) (int, error) {
 	tun.writeOpMu.Lock()
 	defer tun.writeOpMu.Unlock()
 	var (
@@ -125,7 +154,7 @@ func (tun *NativeTun) Write(bufs [][]byte, offset int) (int, error) {
 	return total, errs
 }
 
-func (tun *NativeTun) Read(bufs [][]byte, sizes []int, offset int) (int, error) {
+func (tun *UserspaceTun) Read(bufs [][]byte, sizes []int, offset int) (int, error) {
 	packetData, ok := <-tun.natRcv
 	if !ok {
 		return 0, os.ErrClosed // channel has been closed
@@ -142,46 +171,19 @@ func (tun *NativeTun) Read(bufs [][]byte, sizes []int, offset int) (int, error) 
 	return 1, nil
 }
 
-func (tun *NativeTun) Events() <-chan Event {
-	return tun.events
-}
-
-func (tun *NativeTun) AddEvent(event Event) {
-	tun.events <- event
-}
-
-func (tun *NativeTun) Close() error {
-	tun.closeOnce.Do(func() {
-		if tun.events != nil {
-			close(tun.events)
-		}
-		if tun.natRcv != nil {
-			close(tun.natRcv)
-		}
-	})
-	if tun.nat != nil {
-		tun.natCancel()
-		tun.nat = nil
-		tun.natCancel = nil
-	}
-	return nil
-}
-
-func (tun *NativeTun) BatchSize() int {
-	return 1
-}
-
-// CreateTUN creates a Device with the provided name and MTU.
-func CreateTUN() (Device, error) {
-	tun := &NativeTun{
+// CreateTUN creates a Device using userspace sockets.
+//
+// TODO: add arguments for UserLocalNat from bringyour/connect.
+func CreateUserspaceTUN() (Device, error) {
+	tun := &UserspaceTun{
 		events:   make(chan Event, 5),
 		toWrite:  make([]int, 0, conn.IdealBatchSize),
 		natTable: make(map[NATKey]NATValue),
 		natRcv:   make(chan []byte),
 	}
 
-	cancelCtx, cancel := context.WithCancel(context.Background())
 	clientId := "test-client-id"
+	cancelCtx, cancel := context.WithCancel(context.Background())
 	tun.nat = connect.NewLocalUserNatWithDefaults(
 		cancelCtx,
 		clientId,
@@ -195,7 +197,7 @@ func CreateTUN() (Device, error) {
 	return tun, nil
 }
 
-func (tun *NativeTun) natReceive(source connect.Path, ipProtocol connect.IpProtocol, packet []byte) {
+func (tun *UserspaceTun) natReceive(source connect.Path, ipProtocol connect.IpProtocol, packet []byte) {
 	pkt := gopacket.NewPacket(packet, layers.LayerTypeIPv4, gopacket.Default)
 
 	if ipv4Layer := pkt.Layer(layers.LayerTypeIPv4); ipv4Layer != nil {

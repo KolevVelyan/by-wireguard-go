@@ -305,7 +305,7 @@ func (device *Device) RoutineHandshake(id int) {
 			// consume reply
 
 			if peer := entry.peer; peer.isRunning.Load() {
-				device.log.Verbosef("Receiving cookie response from %s", elem.endpoint.DstToString())
+				device.log.Verbosef("Receiving cookie response from %s", elem.endpoint.ToString())
 				if !peer.cookieGenerator.ConsumeReply(&reply) {
 					device.log.Verbosef("Could not decrypt invalid cookie response")
 				}
@@ -328,14 +328,14 @@ func (device *Device) RoutineHandshake(id int) {
 
 				// verify MAC2 field
 
-				if !device.cookieChecker.CheckMAC2(elem.packet, elem.endpoint.DstToBytes()) {
+				if !device.cookieChecker.CheckMAC2(elem.packet, elem.endpoint.ToBytes()) {
 					device.SendHandshakeCookie(&elem)
 					goto skip
 				}
 
 				// check ratelimiter
 
-				if !device.rate.limiter.Allow(elem.endpoint.DstIP()) {
+				if !device.rate.limiter.Allow(elem.endpoint.IP()) {
 					goto skip
 				}
 			}
@@ -364,7 +364,7 @@ func (device *Device) RoutineHandshake(id int) {
 
 			peer := device.ConsumeMessageInitiation(&msg)
 			if peer == nil {
-				device.log.Verbosef("Received invalid initiation message from %s", elem.endpoint.DstToString())
+				device.log.Verbosef("Received invalid initiation message from %s", elem.endpoint.ToString())
 				goto skip
 			}
 
@@ -397,7 +397,7 @@ func (device *Device) RoutineHandshake(id int) {
 
 			peer := device.ConsumeMessageResponse(&msg)
 			if peer == nil {
-				device.log.Verbosef("Received invalid response message from %s", elem.endpoint.DstToString())
+				device.log.Verbosef("Received invalid response message from %s", elem.endpoint.ToString())
 				goto skip
 			}
 

@@ -24,8 +24,7 @@ var (
 	_ Bind = (*StdNetBind)(nil)
 )
 
-// StdNetBind implements Bind for all platforms. While Windows has its own Bind
-// (see bind_windows.go), it may fall back to StdNetBind.
+// StdNetBind implements Bind for all platforms.
 // TODO: Remove usage of ipv{4,6}.PacketConn when net.UDPConn has comparable
 // methods for sending and receiving multiple datagrams per-syscall. See the
 // proposal in https://github.com/golang/go/issues/45886#issuecomment-1218301564.
@@ -48,6 +47,8 @@ type StdNetBind struct {
 	blackhole6 bool
 }
 
+func NewDefaultBind() Bind { return NewStdNetBind() }
+
 func NewStdNetBind() Bind {
 	return &StdNetBind{
 		udpAddrPool: sync.Pool{
@@ -65,7 +66,7 @@ func NewStdNetBind() Bind {
 				msgs := make([]ipv6.Message, IdealBatchSize)
 				for i := range msgs {
 					msgs[i].Buffers = make(net.Buffers, 1)
-					msgs[i].OOB = make([]byte, 0, stickyControlSize+gsoControlSize)
+					msgs[i].OOB = make([]byte, 0, gsoControlSize)
 				}
 				return &msgs
 			},
@@ -76,10 +77,6 @@ func NewStdNetBind() Bind {
 type StdNetEndpoint struct {
 	// AddrPort is the endpoint destination.
 	netip.AddrPort
-	// src is the current sticky source address and interface index, if
-	// supported. Typically this is a PKTINFO structure from/for control
-	// messages, see unix.PKTINFO for an example.
-	src []byte
 }
 
 var (
@@ -97,26 +94,17 @@ func (*StdNetBind) ParseEndpoint(s string) (Endpoint, error) {
 	}, nil
 }
 
-func (e *StdNetEndpoint) ClearSrc() {
-	if e.src != nil {
-		// Truncate src, no need to reallocate.
-		e.src = e.src[:0]
-	}
-}
-
-func (e *StdNetEndpoint) DstIP() netip.Addr {
+func (e *StdNetEndpoint) IP() netip.Addr {
 	return e.AddrPort.Addr()
 }
 
-// See control_default,linux, etc for implementations of SrcIP and SrcIfidx.
-
-func (e *StdNetEndpoint) DstToBytes() []byte {
-	b, _ := e.AddrPort.MarshalBinary()
-	return b
+func (e *StdNetEndpoint) ToString() string {
+	return e.AddrPort.String()
 }
 
-func (e *StdNetEndpoint) DstToString() string {
-	return e.AddrPort.String()
+func (e *StdNetEndpoint) ToBytes() []byte {
+	b, _ := e.AddrPort.MarshalBinary()
+	return b
 }
 
 func listenNet(network string, port int) (*net.UDPConn, int, error) {
@@ -271,7 +259,6 @@ func (s *StdNetBind) receiveIP(
 		}
 		addrPort := msg.Addr.(*net.UDPAddr).AddrPort()
 		ep := &StdNetEndpoint{AddrPort: addrPort} // TODO: remove allocation
-		getSrcFromControl(msg.OOB[:msg.NN], ep)
 		eps[i] = ep
 	}
 	return numMsgs, nil
@@ -325,6 +312,10 @@ func (s *StdNetBind) Close() error {
 	return err2
 }
 
+func (s *StdNetBind) SetMark(mark uint32) error {
+	return nil
+}
+
 type ErrUDPGSODisabled struct {
 	onLaddr  string
 	RetryErr error
@@ -345,7 +336,7 @@ func (s *StdNetBind) Send(bufs [][]byte, endpoint Endpoint) error {
 	offload := s.ipv4TxOffload
 	br := batchWriter(s.ipv4PC)
 	is6 := false
-	if endpoint.DstIP().Is6() {
+	if endpoint.IP().Is6() {
 		blackhole = s.blackhole6
 		conn = s.ipv6
 		br = s.ipv6PC
@@ -366,11 +357,11 @@ func (s *StdNetBind) Send(bufs [][]byte, endpoint Endpoint) error {
 	ua := s.udpAddrPool.Get().(*net.UDPAddr)
 	defer s.udpAddrPool.Put(ua)
 	if is6 {
-		as16 := endpoint.DstIP().As16()
+		as16 := endpoint.IP().As16()
 		copy(ua.IP, as16[:])
 		ua.IP = ua.IP[:16]
 	} else {
-		as4 := endpoint.DstIP().As4()
+		as4 := endpoint.IP().As4()
 		copy(ua.IP, as4[:])
 		ua.IP = ua.IP[:4]
 	}
@@ -399,7 +390,6 @@ retry:
 		for i := range bufs {
 			(*msgs)[i].Addr = ua
 			(*msgs)[i].Buffers[0] = bufs[i]
-			setSrcControl(&(*msgs)[i].OOB, endpoint.(*StdNetEndpoint))
 		}
 		err = s.send(conn, br, (*msgs)[:len(bufs)])
 	}
@@ -455,7 +445,7 @@ func coalesceMessages(addr *net.UDPAddr, ep *StdNetEndpoint, bufs [][]byte, msgs
 		endBatch bool // tracking flag to start a new batch on next iteration of bufs
 	)
 	maxPayloadLen := maxIPv4PayloadLen
-	if ep.DstIP().Is6() {
+	if ep.IP().Is6() {
 		maxPayloadLen = maxIPv6PayloadLen
 	}
 	for i, buf := range bufs {
@@ -489,7 +479,6 @@ func coalesceMessages(addr *net.UDPAddr, ep *StdNetEndpoint, bufs [][]byte, msgs
 		endBatch = false
 		base++
 		gsoSize = len(buf)
-		setSrcControl(&msgs[base].OOB, ep)
 		msgs[base].Buffers[0] = buf
 		msgs[base].Addr = addr
 		dgramCnt = 1

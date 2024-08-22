@@ -13,7 +13,6 @@ import (
 
 	"golang.zx2c4.com/wireguard/conn"
 	"golang.zx2c4.com/wireguard/ratelimiter"
-	"golang.zx2c4.com/wireguard/rwcancel"
 	"golang.zx2c4.com/wireguard/tun"
 )
 
@@ -41,9 +40,8 @@ type Device struct {
 		stopping sync.WaitGroup
 		sync.RWMutex
 		bind          conn.Bind // bind interface
-		netlinkCancel *rwcancel.RWCancel
-		port          uint16 // listening port
-		fwmark        uint32 // mark value (0 = disabled)
+		port          uint16    // listening port
+		fwmark        uint32    // mark value (0 = disabled)
 		brokenRoaming bool
 	}
 
@@ -425,9 +423,6 @@ func (device *Device) SendKeepalivesToPeersWithCurrentKeypair() {
 func closeBindLocked(device *Device) error {
 	var err error
 	netc := &device.net
-	if netc.netlinkCancel != nil {
-		netc.netlinkCancel.Cancel()
-	}
 	if netc.bind != nil {
 		err = netc.bind.Close()
 	}
@@ -453,17 +448,11 @@ func (device *Device) BindSetMark(mark uint32) error {
 	// update fwmark on existing bind
 	device.net.fwmark = mark
 	if device.isUp() && device.net.bind != nil {
+		device.log.Verbosef("Setting fwmark is not supported.")
 		if err := device.net.bind.SetMark(mark); err != nil {
 			return err
 		}
 	}
-
-	// clear cached source addresses
-	device.peers.RLock()
-	for _, peer := range device.peers.keyMap {
-		peer.markEndpointSrcForClearing()
-	}
-	device.peers.RUnlock()
 
 	return nil
 }
@@ -493,13 +482,6 @@ func (device *Device) BindUpdate() error {
 		return err
 	}
 
-	netc.netlinkCancel, err = device.startRouteListener(netc.bind)
-	if err != nil {
-		netc.bind.Close()
-		netc.port = 0
-		return err
-	}
-
 	// set fwmark
 	if netc.fwmark != 0 {
 		err = netc.bind.SetMark(netc.fwmark)
@@ -507,13 +489,6 @@ func (device *Device) BindUpdate() error {
 			return err
 		}
 	}
-
-	// clear cached source addresses
-	device.peers.RLock()
-	for _, peer := range device.peers.keyMap {
-		peer.markEndpointSrcForClearing()
-	}
-	device.peers.RUnlock()
 
 	// start receiving routines
 	device.net.stopping.Add(len(recvFns))
