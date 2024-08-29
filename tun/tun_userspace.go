@@ -19,11 +19,11 @@ import (
 
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/layers"
-	"golang.zx2c4.com/wireguard/conn"
-	"golang.zx2c4.com/wireguard/logger"
 
 	"bringyour.com/connect"
 	"bringyour.com/protocol"
+	"bringyour.com/wireguard/conn"
+	"bringyour.com/wireguard/logger"
 )
 
 type NATKey struct {
@@ -49,6 +49,11 @@ type UserspaceTun struct {
 
 	nat       *connect.LocalUserNat
 	natCancel context.CancelFunc
+
+	publicIP struct { // used to NAT outgoing packets
+		v4 *net.IP
+		v6 *net.IP
+	}
 }
 
 func (tun *UserspaceTun) MTU() int {
@@ -96,64 +101,93 @@ func (tun *UserspaceTun) Write(bufs [][]byte, offset int) (int, error) {
 		tun.toWrite = append(tun.toWrite, i)
 	}
 	for _, bufsI := range tun.toWrite {
-		packetData := bufs[bufsI][offset:] // TODO: might need to keep offset in beginning?
+		packetData := bufs[bufsI][offset:]
 		packet := gopacket.NewPacket(packetData, layers.LayerTypeIPv4, gopacket.Default)
 
-		// parse IPv4 layer
-		if ipv4Layer := packet.Layer(layers.LayerTypeIPv4); ipv4Layer != nil {
-			transportLayer := packet.TransportLayer()
-			if transportLayer == nil {
-				errs = errors.Join(errs, fmt.Errorf("no transport layer found in packet"))
-				continue
-			}
-
-			ipv4 := ipv4Layer.(*layers.IPv4)
-			localSrcIP := NATValue{IP: ipv4.SrcIP} // get pre NAT IP
-
-			ipv4.SrcIP = net.IPv4(172, 245, 118, 233)
-			ipv4.TTL -= 1
-
-			natKey := NATKey{}
-			natKey.IP = ipv4.SrcIP.String()
-
-			// set network layer for transport layer's checksum and get port for NAT
-			switch t := transportLayer.(type) {
-			case *layers.TCP:
-				t.SetNetworkLayerForChecksum(ipv4)
-				natKey.Port = int(t.SrcPort)
-			case *layers.UDP:
-				t.SetNetworkLayerForChecksum(ipv4)
-				natKey.Port = int(t.SrcPort)
-			default:
-				errs = errors.Join(errs, fmt.Errorf("unsupported transport layer type: %T", t))
-				continue
-			}
-
-			buffer := gopacket.NewSerializeBuffer()
-			options := gopacket.SerializeOptions{FixLengths: true, ComputeChecksums: true}
-			err := gopacket.SerializeLayers(buffer, options, ipv4, transportLayer.(gopacket.SerializableLayer), gopacket.Payload(transportLayer.LayerPayload()))
-			if err != nil {
-				errs = errors.Join(errs, fmt.Errorf("failed to serialize IPv4 packet: %w", err))
-				continue
-			}
-
-			modifiedPacket := buffer.Bytes()
-			ok := tun.nat.SendPacket(connect.Path{}, protocol.ProvideMode_Network, modifiedPacket, 1*time.Second)
-			if !ok {
-				errs = errors.Join(errs, errors.New("failed to send packet through NAT"))
-			} else {
-				total += 1
-
-				// add nat entry
-				tun.natTableMu.Lock()
-				tun.natTable[natKey] = localSrcIP
-				tun.natTableMu.Unlock()
-			}
-		} else {
-			errs = errors.Join(errs, fmt.Errorf("packet has no IPv4/IPv6 layer"))
+		count, err := tun.processWritePacket(packet)
+		if err != nil {
+			errs = errors.Join(errs, err)
 		}
+		total += count
 	}
 	return total, errs
+}
+
+// processWritePacket modifies the packet and sends it through the NAT.
+// It returns the number of packets sent and an error if any.
+func (tun *UserspaceTun) processWritePacket(packet gopacket.Packet) (int, error) {
+	var networkLayer gopacket.NetworkLayer // store either IPv4 or IPv6 layer
+	var localSrcIP NATValue
+
+	if ipv4Layer := packet.Layer(layers.LayerTypeIPv4); ipv4Layer != nil {
+		// NAT IPv4 packet
+		ipv4 := ipv4Layer.(*layers.IPv4)
+		localSrcIP = NATValue{IP: ipv4.SrcIP}
+		if tun.publicIP.v4 == nil {
+			return 0, errors.New("cannot send IPv4 packet: no public IPv4 address set")
+		}
+		ipv4.SrcIP = *tun.publicIP.v4
+		ipv4.TTL -= 1
+		networkLayer = ipv4
+	} else if ipv6Layer := packet.Layer(layers.LayerTypeIPv6); ipv6Layer != nil {
+		// NAT IPv6 packet
+		ipv6 := ipv6Layer.(*layers.IPv6)
+		localSrcIP = NATValue{IP: ipv6.SrcIP}
+		if tun.publicIP.v6 == nil {
+			return 0, errors.New("cannot send IPv6 packet: no public IPv6 address set")
+		}
+		ipv6.SrcIP = *tun.publicIP.v6
+		ipv6.HopLimit -= 1
+		networkLayer = ipv6
+	} else {
+		return 0, fmt.Errorf("packet has no IPv4/IPv6 layer")
+	}
+
+	transportLayer := packet.TransportLayer()
+	if transportLayer == nil {
+		return 0, nil // NOTE: ignore packet if no transport layer found (e.g. ICMP)
+	}
+
+	natKey := NATKey{
+		IP: networkLayer.NetworkFlow().Src().String(),
+	}
+
+	// set source port and update checksum
+	switch t := transportLayer.(type) {
+	case *layers.TCP:
+		t.SetNetworkLayerForChecksum(networkLayer)
+		natKey.Port = int(t.SrcPort)
+	case *layers.UDP:
+		t.SetNetworkLayerForChecksum(networkLayer)
+		natKey.Port = int(t.SrcPort)
+	default:
+		return 0, fmt.Errorf("unsupported transport layer type: %T", t)
+	}
+
+	// serialize modified packet
+	buffer := gopacket.NewSerializeBuffer()
+	options := gopacket.SerializeOptions{FixLengths: true, ComputeChecksums: true}
+	err := gopacket.SerializeLayers(buffer, options,
+		networkLayer.(gopacket.SerializableLayer),
+		transportLayer.(gopacket.SerializableLayer),
+		gopacket.Payload(transportLayer.LayerPayload()))
+	if err != nil {
+		return 0, fmt.Errorf("failed to serialize modified packet: %w", err)
+	}
+
+	// send packet through NAT
+	modifiedPacket := buffer.Bytes()
+	ok := tun.nat.SendPacket(connect.Path{}, protocol.ProvideMode_Network, modifiedPacket, 1*time.Second)
+	if !ok {
+		return 0, errors.New("failed to send packet through NAT")
+	}
+
+	// add nat entry
+	tun.natTableMu.Lock()
+	tun.natTable[natKey] = localSrcIP
+	tun.natTableMu.Unlock()
+
+	return 1, nil
 }
 
 func (tun *UserspaceTun) Read(bufs [][]byte, sizes []int, offset int) (int, error) {
@@ -176,7 +210,7 @@ func (tun *UserspaceTun) Read(bufs [][]byte, sizes []int, offset int) (int, erro
 // CreateTUN creates a Device using userspace sockets.
 //
 // TODO: add arguments for UserLocalNat from bringyour/connect.
-func CreateUserspaceTUN(logger *logger.Logger) (Device, error) {
+func CreateUserspaceTUN(logger *logger.Logger, publicIPv4 *net.IP, publicIPv6 *net.IP) (Device, error) {
 	tun := &UserspaceTun{
 		events:   make(chan Event, 5),
 		toWrite:  make([]int, 0, conn.IdealBatchSize),
@@ -184,6 +218,8 @@ func CreateUserspaceTUN(logger *logger.Logger) (Device, error) {
 		natRcv:   make(chan []byte),
 		log:      logger,
 	}
+	tun.publicIP.v4 = publicIPv4
+	tun.publicIP.v6 = publicIPv6
 
 	clientId := "test-client-id"
 	cancelCtx, cancel := context.WithCancel(context.Background())
@@ -200,63 +236,83 @@ func CreateUserspaceTUN(logger *logger.Logger) (Device, error) {
 	return tun, nil
 }
 
+// natReceive is a callback for tun.nat to receive packets.
 func (tun *UserspaceTun) natReceive(source connect.Path, ipProtocol connect.IpProtocol, packet []byte) {
 	pkt := gopacket.NewPacket(packet, layers.LayerTypeIPv4, gopacket.Default)
+	tun.processNatReceivedPacket(pkt)
+}
 
-	if ipv4Layer := pkt.Layer(layers.LayerTypeIPv4); ipv4Layer != nil {
-		transportLayer := pkt.TransportLayer()
-		if transportLayer == nil {
-			tun.log.Verbosef("NatReceive: no transport layer found in packet")
-			return
-		}
+// processNatReceivedPacket NATs received packets.
+func (tun *UserspaceTun) processNatReceivedPacket(packet gopacket.Packet) {
+	var networkLayer gopacket.NetworkLayer // store either IPv4 or IPv6 layer
 
-		ipv4 := ipv4Layer.(*layers.IPv4)
-
-		var dstPort int
-		switch t := transportLayer.(type) {
-		case *layers.TCP:
-			dstPort = int(t.DstPort)
-		case *layers.UDP:
-			dstPort = int(t.DstPort)
-		default:
-			tun.log.Verbosef("NatReceive: unsupported transport layer type: %T", t)
-			return
-		}
-
-		natKey := NATKey{
-			IP:   ipv4.DstIP.String(),
-			Port: dstPort,
-		}
-
-		localDstIP, found := tun.natTable[natKey]
-		if !found {
-			tun.log.Verbosef("NatReceive: no NAT entry found for %s:%d", ipv4.DstIP, dstPort)
-			return
-		}
-		ipv4.DstIP = localDstIP.IP
-
-		// set network layer for transport layer's checksum computation
-		switch t := transportLayer.(type) {
-		case *layers.TCP:
-			t.SetNetworkLayerForChecksum(ipv4)
-		case *layers.UDP:
-			t.SetNetworkLayerForChecksum(ipv4)
-		default:
-			tun.log.Verbosef("NatReceive: unsupported transport layer type: %T", t)
-			return
-		}
-
-		buffer := gopacket.NewSerializeBuffer()
-		options := gopacket.SerializeOptions{FixLengths: true, ComputeChecksums: true}
-		err := gopacket.SerializeLayers(buffer, options, ipv4, transportLayer.(gopacket.SerializableLayer), gopacket.Payload(transportLayer.LayerPayload()))
-		if err != nil {
-			tun.log.Verbosef("NatReceive: failed to serialize modified packet: %v", err)
-			return
-		}
-
-		modifiedPacket := buffer.Bytes()
-		tun.natRcv <- modifiedPacket
+	if ipv4Layer := packet.Layer(layers.LayerTypeIPv4); ipv4Layer != nil {
+		networkLayer = ipv4Layer.(*layers.IPv4)
+	} else if ipv6Layer := packet.Layer(layers.LayerTypeIPv6); ipv6Layer != nil {
+		networkLayer = ipv6Layer.(*layers.IPv6)
 	} else {
 		tun.log.Verbosef("NatReceive: packet has no IPv4/IPv6 layer")
+		return
 	}
+
+	transportLayer := packet.TransportLayer()
+	if transportLayer == nil {
+		return // NOTE: ignore packet if no transport layer found (e.g. ICMP)
+	}
+
+	// compute nat key
+	natKey := NATKey{
+		IP: networkLayer.NetworkFlow().Dst().String(),
+	}
+	switch t := transportLayer.(type) {
+	case *layers.TCP:
+		natKey.Port = int(t.DstPort)
+	case *layers.UDP:
+		natKey.Port = int(t.DstPort)
+	default:
+		tun.log.Verbosef("NatReceive: unsupported transport layer type: %T", t)
+		return
+	}
+
+	// find NAT entry
+	localDstIP, found := tun.natTable[natKey]
+	if !found {
+		tun.log.Verbosef("NatReceive: no NAT entry found for %s:%d", natKey.IP, natKey.Port)
+		return
+	}
+
+	// modify packet based on NAT entry
+	switch ip := networkLayer.(type) {
+	case *layers.IPv4:
+		ip.DstIP = localDstIP.IP
+	case *layers.IPv6:
+		ip.DstIP = localDstIP.IP
+	default:
+		tun.log.Verbosef("NatReceive: unsupported network layer type: %T", ip)
+		return
+	}
+
+	// update checksum
+	switch t := transportLayer.(type) {
+	case *layers.TCP:
+		t.SetNetworkLayerForChecksum(networkLayer)
+	case *layers.UDP:
+		t.SetNetworkLayerForChecksum(networkLayer)
+	default:
+		tun.log.Verbosef("NatReceive: unsupported transport layer type: %T", t)
+		return
+	}
+
+	// serialize modified packet
+	buffer := gopacket.NewSerializeBuffer()
+	options := gopacket.SerializeOptions{FixLengths: true, ComputeChecksums: true}
+	err := gopacket.SerializeLayers(buffer, options, networkLayer.(gopacket.SerializableLayer), transportLayer.(gopacket.SerializableLayer), gopacket.Payload(transportLayer.LayerPayload()))
+	if err != nil {
+		tun.log.Verbosef("NatReceive: failed to serialize modified IPv4 packet: %v", err)
+		return
+	}
+
+	// send modified packet to tun
+	modifiedPacket := buffer.Bytes()
+	tun.natRcv <- modifiedPacket
 }

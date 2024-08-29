@@ -6,7 +6,7 @@
 package device
 
 import (
-	"golang.zx2c4.com/wireguard/tun"
+	"bringyour.com/wireguard/tun"
 )
 
 const DefaultMTU = 1420

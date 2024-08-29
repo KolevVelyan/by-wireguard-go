@@ -6,54 +6,29 @@
 package main
 
 import (
-	"bytes"
-	"encoding/base64"
-	"encoding/hex"
+	"net"
 	"os"
 	"os/signal"
 	"syscall"
 
-	"golang.zx2c4.com/wireguard/conn"
-	"golang.zx2c4.com/wireguard/device"
-	"golang.zx2c4.com/wireguard/logger"
-	"golang.zx2c4.com/wireguard/tun"
+	"bringyour.com/wireguard/conn"
+	"bringyour.com/wireguard/device"
+	"bringyour.com/wireguard/logger"
+	"bringyour.com/wireguard/tun"
+	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
 )
-
-// uapiCfg returns a string that contains cfg formatted use with IpcSet.
-// cfg is a series of alternating key/value strings.
-func helperCfg(cfg ...string) string {
-	if len(cfg)%2 != 0 {
-		panic("odd number of args to uapiReader")
-	}
-	buf := new(bytes.Buffer)
-	for i, s := range cfg {
-		buf.WriteString(s)
-		sep := byte('\n')
-		if i%2 == 0 {
-			sep = '='
-		}
-		buf.WriteByte(sep)
-	}
-	return buf.String()
-}
-
-// converts key from base64 to hex
-func getHexKey(key string) string {
-	decodedKey, err := base64.StdEncoding.DecodeString(key)
-	if err != nil {
-		panic(err)
-	}
-	return hex.EncodeToString(decodedKey)
-}
 
 func main() {
 	// set logger to wanted log level (available - LogLevelVerbose, LogLevelError, LogLevelSilent)
 	logLevel := logger.LogLevelVerbose // verbose/debug logging
 	logger := logger.NewLogger(logLevel, "")
 
+	// public IP addresses (change these to server's public IP addresses)
+	var publicIPv4 net.IP = net.IPv4(1, 2, 3, 4)
+	var publicIPv6 net.IP = nil
+
 	// tun device
-	// TODO: add settings for UserLocalNat when creating UserspaceTUN
-	utun, err := tun.CreateUserspaceTUN(logger)
+	utun, err := tun.CreateUserspaceTUN(logger, &publicIPv4, &publicIPv6)
 	if err != nil {
 		logger.Errorf("Failed to create TUN device: %v", err)
 		os.Exit(1)
@@ -67,20 +42,42 @@ func main() {
 	privateKeyServer := "__PLACEHOLDER__"
 	publicKeyPeer := "__PLACEHOLDER__"
 
-	// ipcSet (set configuration)
-	config := helperCfg(
-		"private_key", getHexKey(privateKeyServer),
-		"listen_port", "33333",
-		"replace_peers", "true",
-		"public_key", getHexKey(publicKeyPeer),
-		"replace_allowed_ips", "true",
-		"allowed_ip", "192.168.90.1/32",
-	)
-	err = device.IpcSet(config)
+	privServer, err := wgtypes.ParseKey(privateKeyServer)
 	if err != nil {
+		logger.Errorf("Invalid server private key provided: %w", err)
+		os.Exit(1)
+	}
+
+	pubPeer, err := wgtypes.ParseKey(publicKeyPeer)
+	if err != nil {
+		logger.Errorf("Invalid peer public key provided: %w", err)
+		os.Exit(1)
+	}
+
+	port := 33336
+
+	// ipcSet (set configuration)
+	config := wgtypes.Config{
+		PrivateKey:   &privServer,
+		ListenPort:   &port,
+		ReplacePeers: true,
+		Peers: []wgtypes.PeerConfig{
+			{
+				PublicKey:         pubPeer,
+				ReplaceAllowedIPs: true,
+				AllowedIPs: []net.IPNet{
+					{
+						IP:   net.IPv4(192, 168, 90, 1),
+						Mask: net.CIDRMask(32, 32),
+					},
+				},
+			},
+		},
+	}
+
+	if err := device.IpcSet(&config); err != nil {
 		logger.Errorf("Failed to Set Config: %v", err)
 		os.Exit(1)
-		return
 	}
 
 	term := make(chan os.Signal, 1) // channel for termination

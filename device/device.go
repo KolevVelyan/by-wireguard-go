@@ -11,10 +11,10 @@ import (
 	"sync/atomic"
 	"time"
 
-	"golang.zx2c4.com/wireguard/conn"
-	"golang.zx2c4.com/wireguard/logger"
-	"golang.zx2c4.com/wireguard/ratelimiter"
-	"golang.zx2c4.com/wireguard/tun"
+	"bringyour.com/wireguard/conn"
+	"bringyour.com/wireguard/logger"
+	"bringyour.com/wireguard/ratelimiter"
+	"bringyour.com/wireguard/tun"
 )
 
 type Device struct {

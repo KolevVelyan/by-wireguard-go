@@ -1,4 +1,4 @@
-module golang.zx2c4.com/wireguard
+module bringyour.com/wireguard
 
 go 1.22.0
 
@@ -14,6 +14,7 @@ require (
 	github.com/google/gopacket v1.1.19
 	golang.org/x/crypto v0.13.0
 	golang.org/x/net v0.15.0
+	golang.zx2c4.com/wireguard/wgctrl v0.0.0-20230429144221-925a1e7659e6
 )
 
 require (
