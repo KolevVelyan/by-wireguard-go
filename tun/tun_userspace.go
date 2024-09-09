@@ -177,7 +177,7 @@ func (tun *UserspaceTun) processWritePacket(packet gopacket.Packet) (int, error)
 
 	// send packet through NAT
 	modifiedPacket := buffer.Bytes()
-	ok := tun.nat.SendPacket(connect.Path{}, protocol.ProvideMode_Network, modifiedPacket, 1*time.Second)
+	ok := tun.nat.SendPacket(connect.TransferPath{}, protocol.ProvideMode_Network, modifiedPacket, 1*time.Second)
 	if !ok {
 		return 0, errors.New("failed to send packet through NAT")
 	}
@@ -237,7 +237,7 @@ func CreateUserspaceTUN(logger *logger.Logger, publicIPv4 *net.IP, publicIPv6 *n
 }
 
 // natReceive is a callback for tun.nat to receive packets.
-func (tun *UserspaceTun) natReceive(source connect.Path, ipProtocol connect.IpProtocol, packet []byte) {
+func (tun *UserspaceTun) natReceive(source connect.TransferPath, ipProtocol connect.IpProtocol, packet []byte) {
 	pkt := gopacket.NewPacket(packet, layers.LayerTypeIPv4, gopacket.Default)
 	tun.processNatReceivedPacket(pkt)
 }
