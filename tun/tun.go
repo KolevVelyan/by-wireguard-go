@@ -5,10 +5,6 @@
 
 package tun
 
-import (
-	"os"
-)
-
 type Event int
 
 const (
@@ -18,9 +14,6 @@ const (
 )
 
 type Device interface {
-	// File returns the file descriptor of the device.
-	File() *os.File
-
 	// Read one or more packets from the Device (without any additional headers).
 	// On a successful read it returns the number of packets read, and sets
 	// packet lengths within the sizes slice. len(sizes) must be >= len(bufs).
@@ -35,13 +28,13 @@ type Device interface {
 	Write(bufs [][]byte, offset int) (int, error)
 
 	// MTU returns the MTU of the Device.
-	MTU() (int, error)
-
-	// Name returns the current name of the Device.
-	Name() (string, error)
+	MTU() int
 
 	// Events returns a channel of type Event, which is fed Device events.
 	Events() <-chan Event
+
+	// AddEvent adds an event to the Device's event channel.
+	AddEvent(event Event)
 
 	// Close stops the Device and closes the Event channel.
 	Close() error

@@ -6,36 +6,21 @@
 package device
 
 import (
-	"fmt"
-
-	"golang.zx2c4.com/wireguard/tun"
+	"bringyour.com/wireguard/tun"
 )
 
 const DefaultMTU = 1420
+
+func (device *Device) AddEvent(event tun.Event) {
+	device.tun.device.AddEvent(event)
+}
 
 func (device *Device) RoutineTUNEventReader() {
 	device.log.Verbosef("Routine: event worker - started")
 
 	for event := range device.tun.device.Events() {
 		if event&tun.EventMTUUpdate != 0 {
-			mtu, err := device.tun.device.MTU()
-			if err != nil {
-				device.log.Errorf("Failed to load updated MTU of device: %v", err)
-				continue
-			}
-			if mtu < 0 {
-				device.log.Errorf("MTU not updated to negative value: %v", mtu)
-				continue
-			}
-			var tooLarge string
-			if mtu > MaxContentSize {
-				tooLarge = fmt.Sprintf(" (too large, capped at %v)", MaxContentSize)
-				mtu = MaxContentSize
-			}
-			old := device.tun.mtu.Swap(int32(mtu))
-			if int(old) != mtu {
-				device.log.Verbosef("MTU updated: %v%s", mtu, tooLarge)
-			}
+			device.log.Verbosef("Current mtu is %v", device.tun.mtu.Load())
 		}
 
 		if event&tun.EventUp != 0 {

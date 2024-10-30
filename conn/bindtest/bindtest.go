@@ -12,7 +12,7 @@ import (
 	"net/netip"
 	"os"
 
-	"golang.zx2c4.com/wireguard/conn"
+	"bringyour.com/wireguard/conn"
 )
 
 type ChannelBind struct {
@@ -55,17 +55,11 @@ func NewChannelBinds() [2]conn.Bind {
 	return [2]conn.Bind{&binds[0], &binds[1]}
 }
 
-func (c ChannelEndpoint) ClearSrc() {}
+func (c ChannelEndpoint) IP() netip.Addr { return netip.AddrFrom4([4]byte{127, 0, 0, 1}) }
 
-func (c ChannelEndpoint) SrcToString() string { return "" }
+func (c ChannelEndpoint) ToString() string { return fmt.Sprintf("127.0.0.1:%d", c) }
 
-func (c ChannelEndpoint) DstToString() string { return fmt.Sprintf("127.0.0.1:%d", c) }
-
-func (c ChannelEndpoint) DstToBytes() []byte { return []byte{byte(c)} }
-
-func (c ChannelEndpoint) DstIP() netip.Addr { return netip.AddrFrom4([4]byte{127, 0, 0, 1}) }
-
-func (c ChannelEndpoint) SrcIP() netip.Addr { return netip.Addr{} }
+func (c ChannelEndpoint) ToBytes() []byte { return []byte{byte(c)} }
 
 func (c *ChannelBind) Open(port uint16) (fns []conn.ReceiveFunc, actualPort uint16, err error) {
 	c.closeSignal = make(chan bool)

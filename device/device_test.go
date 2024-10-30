@@ -9,10 +9,9 @@ import (
 	"bytes"
 	"encoding/hex"
 	"fmt"
-	"io"
 	"math/rand"
+	"net"
 	"net/netip"
-	"os"
 	"runtime"
 	"runtime/pprof"
 	"sync"
@@ -20,37 +19,17 @@ import (
 	"testing"
 	"time"
 
-	"golang.zx2c4.com/wireguard/conn"
-	"golang.zx2c4.com/wireguard/conn/bindtest"
-	"golang.zx2c4.com/wireguard/tun"
-	"golang.zx2c4.com/wireguard/tun/tuntest"
+	"bringyour.com/wireguard/conn"
+	"bringyour.com/wireguard/conn/bindtest"
+	"bringyour.com/wireguard/logger"
+	"bringyour.com/wireguard/tun"
+	"bringyour.com/wireguard/tun/tuntest"
+	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
 )
-
-// uapiCfg returns a string that contains cfg formatted use with IpcSet.
-// cfg is a series of alternating key/value strings.
-// uapiCfg exists because editors and humans like to insert
-// whitespace into configs, which can cause failures, some of which are silent.
-// For example, a leading blank newline causes the remainder
-// of the config to be silently ignored.
-func uapiCfg(cfg ...string) string {
-	if len(cfg)%2 != 0 {
-		panic("odd number of args to uapiReader")
-	}
-	buf := new(bytes.Buffer)
-	for i, s := range cfg {
-		buf.WriteString(s)
-		sep := byte('\n')
-		if i%2 == 0 {
-			sep = '='
-		}
-		buf.WriteByte(sep)
-	}
-	return buf.String()
-}
 
 // genConfigs generates a pair of configs that connect to each other.
 // The configs use distinct, probably-usable ports.
-func genConfigs(tb testing.TB) (cfgs, endpointCfgs [2]string) {
+func genConfigs(tb testing.TB) (cfgs, endpointCfgs [2]wgtypes.Config) {
 	var key1, key2 NoisePrivateKey
 	_, err := rand.Read(key1[:])
 	if err != nil {
@@ -60,34 +39,77 @@ func genConfigs(tb testing.TB) (cfgs, endpointCfgs [2]string) {
 	if err != nil {
 		tb.Errorf("unable to generate private key random bytes: %v", err)
 	}
-	pub1, pub2 := key1.publicKey(), key2.publicKey()
 
-	cfgs[0] = uapiCfg(
-		"private_key", hex.EncodeToString(key1[:]),
-		"listen_port", "0",
-		"replace_peers", "true",
-		"public_key", hex.EncodeToString(pub2[:]),
-		"protocol_version", "1",
-		"replace_allowed_ips", "true",
-		"allowed_ip", "1.0.0.2/32",
-	)
-	endpointCfgs[0] = uapiCfg(
-		"public_key", hex.EncodeToString(pub2[:]),
-		"endpoint", "127.0.0.1:%d",
-	)
-	cfgs[1] = uapiCfg(
-		"private_key", hex.EncodeToString(key2[:]),
-		"listen_port", "0",
-		"replace_peers", "true",
-		"public_key", hex.EncodeToString(pub1[:]),
-		"protocol_version", "1",
-		"replace_allowed_ips", "true",
-		"allowed_ip", "1.0.0.1/32",
-	)
-	endpointCfgs[1] = uapiCfg(
-		"public_key", hex.EncodeToString(pub1[:]),
-		"endpoint", "127.0.0.1:%d",
-	)
+	key1wg, err := HexToKey(hex.EncodeToString(key1[:]))
+	if err != nil {
+		tb.Errorf("unable to convert key to wgtypes.Key: %v", err)
+	}
+	key2wg, err := HexToKey(hex.EncodeToString(key2[:]))
+	if err != nil {
+		tb.Errorf("unable to convert key to wgtypes.Key: %v", err)
+	}
+
+	port1 := 0
+
+	cfgs[0] = wgtypes.Config{
+		PrivateKey:   &key1wg,
+		ListenPort:   &port1,
+		ReplacePeers: true,
+		Peers: []wgtypes.PeerConfig{
+			{
+				PublicKey:         key2wg.PublicKey(),
+				ReplaceAllowedIPs: true,
+				AllowedIPs: []net.IPNet{
+					{
+						IP:   net.IPv4(1, 0, 0, 2),
+						Mask: net.CIDRMask(32, 32),
+					},
+				},
+			},
+		},
+	}
+	endpointCfgs[0] = wgtypes.Config{
+		Peers: []wgtypes.PeerConfig{
+			{
+				PublicKey: key2wg.PublicKey(),
+				Endpoint: &net.UDPAddr{
+					IP:   net.IPv4(127, 0, 0, 1),
+					Port: 0,
+				},
+			},
+		},
+	}
+
+	port2 := 0
+
+	cfgs[1] = wgtypes.Config{
+		PrivateKey:   &key2wg,
+		ListenPort:   &port2,
+		ReplacePeers: true,
+		Peers: []wgtypes.PeerConfig{
+			{
+				PublicKey:         key1wg.PublicKey(),
+				ReplaceAllowedIPs: true,
+				AllowedIPs: []net.IPNet{
+					{
+						IP:   net.IPv4(1, 0, 0, 1),
+						Mask: net.CIDRMask(32, 32),
+					},
+				},
+			},
+		},
+	}
+	endpointCfgs[1] = wgtypes.Config{
+		Peers: []wgtypes.PeerConfig{
+			{
+				PublicKey: key1wg.PublicKey(),
+				Endpoint: &net.UDPAddr{
+					IP:   net.IPv4(127, 0, 0, 1),
+					Port: 0,
+				},
+			},
+		},
+	}
 	return
 }
 
@@ -162,12 +184,12 @@ func genTestPair(tb testing.TB, realSocket bool) (pair testPair) {
 		p := &pair[i]
 		p.tun = tuntest.NewChannelTUN()
 		p.ip = netip.AddrFrom4([4]byte{1, 0, 0, byte(i + 1)})
-		level := LogLevelVerbose
+		level := logger.LogLevelVerbose
 		if _, ok := tb.(*testing.B); ok && !testing.Verbose() {
-			level = LogLevelError
+			level = logger.LogLevelError
 		}
-		p.dev = NewDevice(p.tun.TUN(), binds[i], NewLogger(level, fmt.Sprintf("dev%d: ", i)))
-		if err := p.dev.IpcSet(cfg[i]); err != nil {
+		p.dev = NewDevice(p.tun.TUN(), binds[i], logger.NewLogger(level, fmt.Sprintf("dev%d: ", i)))
+		if err := p.dev.IpcSet(&cfg[i]); err != nil {
 			tb.Errorf("failed to configure device %d: %v", i, err)
 			p.dev.Close()
 			continue
@@ -177,11 +199,11 @@ func genTestPair(tb testing.TB, realSocket bool) (pair testPair) {
 			p.dev.Close()
 			continue
 		}
-		endpointCfg[i^1] = fmt.Sprintf(endpointCfg[i^1], p.dev.net.port)
+		endpointCfg[i^1].Peers[0].Endpoint.Port = int(p.dev.net.port)
 	}
 	for i := range pair {
 		p := &pair[i]
-		if err := p.dev.IpcSet(endpointCfg[i]); err != nil {
+		if err := p.dev.IpcSet(&endpointCfg[i]); err != nil {
 			tb.Errorf("failed to configure device endpoint %d: %v", i, err)
 			p.dev.Close()
 			continue
@@ -212,7 +234,20 @@ func TestUpDown(t *testing.T) {
 		pair := genTestPair(t, false)
 		for i := range pair {
 			for k := range pair[i].dev.peers.keyMap {
-				pair[i].dev.IpcSet(fmt.Sprintf("public_key=%s\npersistent_keepalive_interval=1\n", hex.EncodeToString(k[:])))
+				kwg, err := HexToKey(hex.EncodeToString(k[:]))
+				if err != nil {
+					t.Errorf("unable to convert key to wgtypes.Key: %v", err)
+				}
+				interval := time.Second
+				conf := wgtypes.Config{
+					Peers: []wgtypes.PeerConfig{
+						{
+							PublicKey:                   kwg.PublicKey(),
+							PersistentKeepaliveInterval: &interval,
+						},
+					},
+				}
+				pair[i].dev.IpcSet(&conf)
 			}
 		}
 		var wg sync.WaitGroup
@@ -269,7 +304,7 @@ func TestConcurrencySafety(t *testing.T) {
 	}()
 	warmup.Wait()
 
-	applyCfg := func(cfg string) {
+	applyCfg := func(cfg *wgtypes.Config) {
 		err := pair[0].dev.IpcSet(cfg)
 		if err != nil {
 			t.Fatal(err)
@@ -283,19 +318,44 @@ func TestConcurrencySafety(t *testing.T) {
 			pub = key
 			break
 		}
-		cfg := uapiCfg(
-			"public_key", hex.EncodeToString(pub[:]),
-			"persistent_keepalive_interval", "1",
-		)
+
+		pubwg, err := HexToKey(hex.EncodeToString(pub[:]))
+		if err != nil {
+			t.Errorf("unable to convert key to wgtypes.Key: %v", err)
+		}
+		interval := time.Second
+		cfg := wgtypes.Config{
+			Peers: []wgtypes.PeerConfig{
+				{
+					PublicKey:                   pubwg,
+					PersistentKeepaliveInterval: &interval,
+				},
+			},
+		}
+
 		for i := 0; i < 1000; i++ {
-			applyCfg(cfg)
+			applyCfg(&cfg)
 		}
 	})
 
 	// Change private keys concurrently with tunnel use.
 	t.Run("privateKey", func(t *testing.T) {
-		bad := uapiCfg("private_key", "7777777777777777777777777777777777777777777777777777777777777777")
-		good := uapiCfg("private_key", hex.EncodeToString(pair[0].dev.staticIdentity.privateKey[:]))
+		key1wg, err := HexToKey("7777777777777777777777777777777777777777777777777777777777777777")
+		if err != nil {
+			t.Errorf("unable to convert key to wgtypes.Key: %v", err)
+		}
+		bad := wgtypes.Config{
+			PrivateKey: &key1wg,
+		}
+
+		key2wg, err := HexToKey(hex.EncodeToString(pair[0].dev.staticIdentity.privateKey[:]))
+		if err != nil {
+			t.Errorf("unable to convert key to wgtypes.Key: %v", err)
+		}
+		good := wgtypes.Config{
+			PrivateKey: &key2wg,
+		}
+
 		// Set iters to a large number like 1000 to flush out data races quickly.
 		// Don't leave it large. That can cause logical races
 		// in which the handshake is interleaved with key changes
@@ -304,8 +364,8 @@ func TestConcurrencySafety(t *testing.T) {
 		// "Received packet with invalid mac1".
 		const iters = 1
 		for i := 0; i < iters; i++ {
-			applyCfg(bad)
-			applyCfg(good)
+			applyCfg(&bad)
+			applyCfg(&good)
 		}
 	})
 
@@ -388,7 +448,7 @@ func BenchmarkUAPIGet(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		pair[0].dev.IpcGetOperation(io.Discard)
+		pair[0].dev.IpcGet()
 	}
 }
 
@@ -436,14 +496,13 @@ type fakeTUNDeviceSized struct {
 	size int
 }
 
-func (t *fakeTUNDeviceSized) File() *os.File { return nil }
 func (t *fakeTUNDeviceSized) Read(bufs [][]byte, sizes []int, offset int) (n int, err error) {
 	return 0, nil
 }
 func (t *fakeTUNDeviceSized) Write(bufs [][]byte, offset int) (int, error) { return 0, nil }
-func (t *fakeTUNDeviceSized) MTU() (int, error)                            { return 0, nil }
-func (t *fakeTUNDeviceSized) Name() (string, error)                        { return "", nil }
+func (t *fakeTUNDeviceSized) MTU() int                                     { return 0 }
 func (t *fakeTUNDeviceSized) Events() <-chan tun.Event                     { return nil }
+func (t *fakeTUNDeviceSized) AddEvent(event tun.Event)                     {}
 func (t *fakeTUNDeviceSized) Close() error                                 { return nil }
 func (t *fakeTUNDeviceSized) BatchSize() int                               { return t.size }
 

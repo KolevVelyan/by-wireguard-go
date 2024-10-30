@@ -11,10 +11,10 @@ import (
 	"sync/atomic"
 	"time"
 
-	"golang.zx2c4.com/wireguard/conn"
-	"golang.zx2c4.com/wireguard/ratelimiter"
-	"golang.zx2c4.com/wireguard/rwcancel"
-	"golang.zx2c4.com/wireguard/tun"
+	"bringyour.com/wireguard/conn"
+	"bringyour.com/wireguard/logger"
+	"bringyour.com/wireguard/ratelimiter"
+	"bringyour.com/wireguard/tun"
 )
 
 type Device struct {
@@ -41,9 +41,8 @@ type Device struct {
 		stopping sync.WaitGroup
 		sync.RWMutex
 		bind          conn.Bind // bind interface
-		netlinkCancel *rwcancel.RWCancel
-		port          uint16 // listening port
-		fwmark        uint32 // mark value (0 = disabled)
+		port          uint16    // listening port
+		fwmark        uint32    // mark value (0 = disabled)
 		brokenRoaming bool
 	}
 
@@ -88,7 +87,7 @@ type Device struct {
 
 	ipcMutex sync.RWMutex
 	closed   chan struct{}
-	log      *Logger
+	log      *logger.Logger
 }
 
 // deviceState represents the state of a Device.
@@ -281,16 +280,16 @@ func (device *Device) SetPrivateKey(sk NoisePrivateKey) error {
 	return nil
 }
 
-func NewDevice(tunDevice tun.Device, bind conn.Bind, logger *Logger) *Device {
+func NewDevice(tunDevice tun.Device, bind conn.Bind, logger *logger.Logger) *Device {
 	device := new(Device)
 	device.state.state.Store(uint32(deviceStateDown))
 	device.closed = make(chan struct{})
 	device.log = logger
 	device.net.bind = bind
 	device.tun.device = tunDevice
-	mtu, err := device.tun.device.MTU()
-	if err != nil {
-		device.log.Errorf("Trouble determining MTU, assuming default: %v", err)
+	mtu := device.tun.device.MTU()
+	if mtu < 0 {
+		device.log.Errorf("Negative MTU %d, assuming default %d", mtu, DefaultMTU)
 		mtu = DefaultMTU
 	}
 	device.tun.mtu.Store(int32(mtu))
@@ -425,9 +424,6 @@ func (device *Device) SendKeepalivesToPeersWithCurrentKeypair() {
 func closeBindLocked(device *Device) error {
 	var err error
 	netc := &device.net
-	if netc.netlinkCancel != nil {
-		netc.netlinkCancel.Cancel()
-	}
 	if netc.bind != nil {
 		err = netc.bind.Close()
 	}
@@ -453,17 +449,11 @@ func (device *Device) BindSetMark(mark uint32) error {
 	// update fwmark on existing bind
 	device.net.fwmark = mark
 	if device.isUp() && device.net.bind != nil {
+		device.log.Verbosef("Setting fwmark is not supported.")
 		if err := device.net.bind.SetMark(mark); err != nil {
 			return err
 		}
 	}
-
-	// clear cached source addresses
-	device.peers.RLock()
-	for _, peer := range device.peers.keyMap {
-		peer.markEndpointSrcForClearing()
-	}
-	device.peers.RUnlock()
 
 	return nil
 }
@@ -493,13 +483,6 @@ func (device *Device) BindUpdate() error {
 		return err
 	}
 
-	netc.netlinkCancel, err = device.startRouteListener(netc.bind)
-	if err != nil {
-		netc.bind.Close()
-		netc.port = 0
-		return err
-	}
-
 	// set fwmark
 	if netc.fwmark != 0 {
 		err = netc.bind.SetMark(netc.fwmark)
@@ -507,13 +490,6 @@ func (device *Device) BindUpdate() error {
 			return err
 		}
 	}
-
-	// clear cached source addresses
-	device.peers.RLock()
-	for _, peer := range device.peers.keyMap {
-		peer.markEndpointSrcForClearing()
-	}
-	device.peers.RUnlock()
 
 	// start receiving routines
 	device.net.stopping.Add(len(recvFns))

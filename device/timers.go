@@ -99,9 +99,6 @@ func expiredRetransmitHandshake(peer *Peer) {
 		peer.timers.handshakeAttempts.Add(1)
 		peer.device.log.Verbosef("%s - Handshake did not complete after %d seconds, retrying (try %d)", peer, int(RekeyTimeout.Seconds()), peer.timers.handshakeAttempts.Load()+1)
 
-		/* We clear the endpoint address src address, in case this is the cause of trouble. */
-		peer.markEndpointSrcForClearing()
-
 		peer.SendHandshakeInitiation(true)
 	}
 }
@@ -118,8 +115,6 @@ func expiredSendKeepalive(peer *Peer) {
 
 func expiredNewHandshake(peer *Peer) {
 	peer.device.log.Verbosef("%s - Retrying handshake because we stopped hearing back after %d seconds", peer, int((KeepaliveTimeout + RekeyTimeout).Seconds()))
-	/* We clear the endpoint address src address, in case this is the cause of trouble. */
-	peer.markEndpointSrcForClearing()
 	peer.SendHandshakeInitiation(false)
 }
 

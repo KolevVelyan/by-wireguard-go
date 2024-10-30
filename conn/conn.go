@@ -28,9 +28,6 @@ const (
 type ReceiveFunc func(packets [][]byte, sizes []int, eps []Endpoint) (n int, err error)
 
 // A Bind listens on a port for both IPv6 and IPv4 UDP traffic.
-//
-// A Bind interface may also be a PeekLookAtSocketFd or BindSocketToInterface,
-// depending on the platform-specific implementation.
 type Bind interface {
 	// Open puts the Bind into a listening state on a given port and reports the actual
 	// port that it bound to. Passing zero results in a random selection.
@@ -57,31 +54,11 @@ type Bind interface {
 	BatchSize() int
 }
 
-// BindSocketToInterface is implemented by Bind objects that support being
-// tied to a single network interface. Used by wireguard-windows.
-type BindSocketToInterface interface {
-	BindSocketToInterface4(interfaceIndex uint32, blackhole bool) error
-	BindSocketToInterface6(interfaceIndex uint32, blackhole bool) error
-}
-
-// PeekLookAtSocketFd is implemented by Bind objects that support having their
-// file descriptor peeked at. Used by wireguard-android.
-type PeekLookAtSocketFd interface {
-	PeekLookAtSocketFd4() (fd int, err error)
-	PeekLookAtSocketFd6() (fd int, err error)
-}
-
-// An Endpoint maintains the source/destination caching for a peer.
-//
-//	dst: the remote address of a peer ("endpoint" in uapi terminology)
-//	src: the local address from which datagrams originate going to the peer
+// An Endpoint maintains the destination caching for a peer.
 type Endpoint interface {
-	ClearSrc()           // clears the source address
-	SrcToString() string // returns the local source address (ip:port)
-	DstToString() string // returns the destination address (ip:port)
-	DstToBytes() []byte  // used for mac2 cookie calculations
-	DstIP() netip.Addr
-	SrcIP() netip.Addr
+	IP() netip.Addr   // the endpoint (uapi terminology)
+	ToString() string // returns the destination address (ip:port)
+	ToBytes() []byte  // used for mac2 cookie calculations
 }
 
 var (

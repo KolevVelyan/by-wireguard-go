@@ -11,7 +11,7 @@ import (
 	"net/netip"
 	"os"
 
-	"golang.zx2c4.com/wireguard/tun"
+	"bringyour.com/wireguard/tun"
 )
 
 func Ping(dst, src netip.Addr) []byte {
@@ -108,8 +108,6 @@ type chTun struct {
 	c *ChannelTUN
 }
 
-func (t *chTun) File() *os.File { return nil }
-
 func (t *chTun) Read(packets [][]byte, sizes []int, offset int) (int, error) {
 	select {
 	case <-t.c.closed:
@@ -146,9 +144,9 @@ func (t *chTun) BatchSize() int {
 
 const DefaultMTU = 1420
 
-func (t *chTun) MTU() (int, error)        { return DefaultMTU, nil }
-func (t *chTun) Name() (string, error)    { return "loopbackTun1", nil }
+func (t *chTun) MTU() int                 { return DefaultMTU }
 func (t *chTun) Events() <-chan tun.Event { return t.c.events }
+func (t *chTun) AddEvent(event tun.Event) { t.c.events <- event }
 func (t *chTun) Close() error {
 	t.Write(nil, -1)
 	return nil

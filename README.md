@@ -1,57 +1,73 @@
-# Go Implementation of [WireGuard](https://www.wireguard.com/)
+# Go Implementation of [WireGuard](https://www.wireguard.com/) in userspace
 
-This is an implementation of WireGuard in Go.
+This is an implementation of WireGuard fully in userspace. The repository is a fork of [wireguard-go](https://github.com/WireGuard/wireguard-go). 
+
+Most distribution of WireGuard are implemented in kernel space and rely on interfaces to functions, userspace-wireguard, however, functions fully in userspace and is meant to be used programmatically.
 
 ## Usage
+This sections describes the different components of userspace-wireguard and how to use them. Check the [Example](#example) section for a full example.
 
-Most Linux kernel WireGuard users are used to adding an interface with `ip link add wg0 type wireguard`. With wireguard-go, instead simply run:
+### `logger`
+A `logger` provides logging for a device using two (Printf-style) functions `Verbosef` and `Errorf`.  Logging functions do not require a trailing newline in the format.
 
-```
-$ wireguard-go wg0
-```
+A logger can be created using the `logger.NewLogger` function. The first argument is the log level, which can be one of `logger.LogLevelSilent`, `logger.LogLevelError`, or `logger.LogLevelVerbose` (for debugging). The second argument is the prepend for the logger.
 
-This will create an interface and fork into the background. To remove the interface, use the usual `ip link del wg0`, or if your system does not support removing interfaces directly, you may instead remove the control socket via `rm -f /var/run/wireguard/wg0.sock`, which will result in wireguard-go shutting down.
+### `tun.Device`
+A `tun.Device` is used to send/receive clear text packets on behalf of WireGuard peers. It is responsible for NAT management and routing from the local subnet of a WireGuard device to the internet.
 
-To run wireguard-go without forking to the background, pass `-f` or `--foreground`:
+The only available implementation of `tun.Device` is `tun.UserspaceTun` which is also the main contribution of this repository. The userspace tun makes use of `bringyour.com/connect` to send/receive packets fully in userspace.
 
-```
-$ wireguard-go -f wg0
-```
+A `tun.Device` can be created using the `tun.CreateUserspaceTUN` function which requires a `logger` and possibly the public IPs for correct NAT. Additionally, a tun device provides access to an `events` channel which can be used to listen for events on the tun device through the functions `Events` and `AddEvent`. The possible types of events are `tun.EventUp`, `tun.EventDown`, and `tun.EventMTUUpdate`.
 
-When an interface is running, you may use [`wg(8)`](https://git.zx2c4.com/wireguard-tools/about/src/man/wg.8) to configure it, as well as the usual `ip(8)` and `ifconfig(8)` commands.
+Other available functions include `Read`, `Write`, `MTU`, `Close`, and `BatchSize`.
 
-To run with more logging you may set the environment variable `LOG_LEVEL=debug`.
+### `device.Device`
+A `device.Device` is used to manage a WireGuard device. It is responsible for creating and managing peers, sending/receiving packets (encrypted and plaintext) and handshakes, and managing the state of the device. Here is stored the static WireGuard identity (public and private key) of the device.
 
-## Platforms
+A `device.Device` can be created using the `device.NewDevice` function which requires a `tun.Device`, `logger` and `conn.Bind` as arguments. The `conn.Bind` is used to send handshakes and encrypted packets and a default implementation can be acquired using `conn.NewDefaultBind`.
 
-### Linux
+A device also provides access to add events to the underlying events channel of the tun device using the `AddEvent` function. Other useful functions inlcude `Close`, `Wait`, `IpcSet`, and `IpcGet`.
 
-This will run on Linux; however you should instead use the kernel module, which is faster and better integrated into the OS. See the [installation page](https://www.wireguard.com/install/) for instructions.
+### `Ipc`
+The official WireGuard projects provides a [cross-platform userspace implementation](https://www.wireguard.com/xplatform/#interface) for consistency in configuration and management of WireGuard devices. A device can be configured using this interface using the `device.IpcSet` and `device.IpcGet` functions. For ease of use in stead of using textual configs we use [wgtypes](https://pkg.go.dev/golang.zx2c4.com/wireguard/wgctrl/wgtypes) objects.
 
-### macOS
+To get the current configuration of a device, use the `device.IpcGet` function which returns a [`wgtypes.Device`](https://pkg.go.dev/golang.zx2c4.com/wireguard/wgctrl/wgtypes#Device) object. To set the configuration of a device, use the `device.IpcSet` function which requires a [`wgtypes.Config`](https://pkg.go.dev/golang.zx2c4.com/wireguard/wgctrl/wgtypes#Config) object as an argument.
 
-This runs on macOS using the utun driver. It does not yet support sticky sockets, and won't support fwmarks because of Darwin limitations. Since the utun driver cannot have arbitrary interface names, you must either use `utun[0-9]+` for an explicit interface name or `utun` to have the kernel select one for you. If you choose `utun` as the interface name, and the environment variable `WG_TUN_NAME_FILE` is defined, then the actual name of the interface chosen by the kernel is written to the file specified by that variable.
+## Example
 
-### Windows
+Below is an example of a simple WireGuard server setup using userspace-wireguard. If you want to view a full example, check `EXAMPLE_SETUP.md` and `main.go` in the root directory.
 
-This runs on Windows, but you should instead use it from the more [fully featured Windows app](https://git.zx2c4.com/wireguard-windows/about/), which uses this as a module.
+```go
+// debug logging
+logger := logger.NewLogger(logger.LogLevelVerbose, "(userspace)") 
 
-### FreeBSD
+// tun device (with public IPv4 but no public IPv6)
+utun, err := tun.CreateUserspaceTUN(logger, net.IPv4(1, 1, 1, 1), nil)
+if err != nil {
+    panic(err)
+}
 
-This will run on FreeBSD. It does not yet support sticky sockets. Fwmark is mapped to `SO_USER_COOKIE`.
+// wireguard device
+device := device.NewDevice(utun, conn.NewDefaultBind(), logger)
 
-### OpenBSD
+// TODO: set your configuration for server
+config := wgtypes.Config{ }
+if err := device.IpcSet(&config); err != nil {
+    panic(err)
+}
 
-This will run on OpenBSD. It does not yet support sticky sockets. Fwmark is mapped to `SO_RTABLE`. Since the tun driver cannot have arbitrary interface names, you must either use `tun[0-9]+` for an explicit interface name or `tun` to have the program select one for you. If you choose `tun` as the interface name, and the environment variable `WG_TUN_NAME_FILE` is defined, then the actual name of the interface chosen by the kernel is written to the file specified by that variable.
+device.AddEvent(tun.EventUp) // start up the device
 
-## Building
+// wait for program to terminate
+term := make(chan os.Signal, 1)
+signal.Notify(term, syscall.SIGTERM)
+signal.Notify(term, os.Interrupt)
+select {
+case <-term:
+case <-device.Wait():
+}
 
-This requires an installation of the latest version of [Go](https://go.dev/).
-
-```
-$ git clone https://git.zx2c4.com/wireguard-go
-$ cd wireguard-go
-$ make
+device.Close() // clean up
 ```
 
 ## License
