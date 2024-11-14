@@ -5,7 +5,7 @@
 
 package device
 
-import "bringyour.com/wireguard/conn"
+import "github.com/urnetwork/userwireguard/conn"
 
 /* Reduce memory consumption for Android */
 

@@ -15,7 +15,7 @@ A logger can be created using the `logger.NewLogger` function. The first argumen
 ### `tun.Device`
 A `tun.Device` is used to send/receive clear text packets on behalf of WireGuard peers. It is responsible for NAT management and routing from the local subnet of a WireGuard device to the internet.
 
-The only available implementation of `tun.Device` is `tun.UserspaceTun` which is also the main contribution of this repository. The userspace tun makes use of `bringyour.com/connect` to send/receive packets fully in userspace.
+The only available implementation of `tun.Device` is `tun.UserspaceTun` which is also the main contribution of this repository. The userspace tun makes use of `github.com/urnetwork/connect` to send/receive packets fully in userspace.
 
 A `tun.Device` can be created using the `tun.CreateUserspaceTUN` function which requires a `logger` and possibly the public IPs for correct NAT. Additionally, a tun device provides access to an `events` channel which can be used to listen for events on the tun device through the functions `Events` and `AddEvent`. The possible types of events are `tun.EventUp`, `tun.EventDown`, and `tun.EventMTUUpdate`.
 

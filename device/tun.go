@@ -6,7 +6,7 @@
 package device
 
 import (
-	"bringyour.com/wireguard/tun"
+	"github.com/urnetwork/userwireguard/tun"
 )
 
 const DefaultMTU = 1420

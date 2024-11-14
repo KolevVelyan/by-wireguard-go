@@ -12,7 +12,7 @@ import (
 	"net/netip"
 	"os"
 
-	"bringyour.com/wireguard/conn"
+	"github.com/urnetwork/userwireguard/conn"
 )
 
 type ChannelBind struct {

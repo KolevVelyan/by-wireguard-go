@@ -19,11 +19,11 @@ import (
 	"testing"
 	"time"
 
-	"bringyour.com/wireguard/conn"
-	"bringyour.com/wireguard/conn/bindtest"
-	"bringyour.com/wireguard/logger"
-	"bringyour.com/wireguard/tun"
-	"bringyour.com/wireguard/tun/tuntest"
+	"github.com/urnetwork/userwireguard/conn"
+	"github.com/urnetwork/userwireguard/conn/bindtest"
+	"github.com/urnetwork/userwireguard/logger"
+	"github.com/urnetwork/userwireguard/tun"
+	"github.com/urnetwork/userwireguard/tun/tuntest"
 	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
 )
 
