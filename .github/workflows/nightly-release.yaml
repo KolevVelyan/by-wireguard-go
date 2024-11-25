@@ -32,15 +32,6 @@ jobs:
         if: ${{ steps.releases_needed.outputs.RELEASE_NEEDED == 'true'}}
         uses: JRMurr/direnv-nix-action@v4.1.0
 
-      - name: run protoc
-        if: ${{ steps.releases_needed.outputs.RELEASE_NEEDED == 'true'}}
-        run: make
-
-      - name: fix go mod
-        if: ${{ steps.releases_needed.outputs.RELEASE_NEEDED == 'true'}}
-        run: |
-          go mod tidy
-
       - name: run tests
         if: ${{ steps.releases_needed.outputs.RELEASE_NEEDED == 'true'}}
         run: |
